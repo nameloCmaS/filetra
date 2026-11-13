@@ -6,10 +6,22 @@ also reviews each choice critically.
 
 ---
 
+## 0. Decisions so far
+
+| # | Question | Decision | Consequences in this document |
+|---|---|---|---|
+| D1 | Users | **Single user for now.** Multi-user may come later. | The first deployment is a **local desktop app** (§6, mode B). It runs with the user's own share permissions, so there is no auth or data-exposure problem yet. Keep the `store` interface so Postgres/server mode remains possible. |
+| D2 | Naming conventions | **Fixed naming modules first.** Configurable company/project/client conventions come later. | Naming parsers sit behind a `NamingConvention` protocol (§5.1). Phase 0 ships hand-written modules (ISO 19650 and others). A data-driven, GUI-editable convention is added later as just another implementation of the same protocol. |
+| D3 | Scale | **About 1,000 shares × about 1,000 files = 10⁶ files at the start**, possibly 10⁸–10⁹ later. | Storage moves to **partitioned Parquet with DuckDB/Polars** for the data and SQLite for control state (§4.6). Execution is **partitioned per share** (§4.4). The share inventory is a first-class part of the design (§5.2). Excel can't be a primary output because of its 1,048,576-row limit. |
+| D4 | Write-back | **Read-only.** | This is enforced by design. Sources only get a read-only file-system interface, and nothing in the engine opens files on a share for writing (§5). |
+| D5 | Outputs | **Easy human/machine-readable formats** (CSV, JSON). | The primary sinks are **CSV, JSON Lines and JSON**. Parquet is the internal format and an optional export. Excel is a convenience sink for small filtered views only (§4.7). |
+
+---
+
 ## 1. Problem restated
 
-- **Volume:** project shares hold anywhere from 10⁵ to 10⁷ files. They are deep, messy, and
-  often reached over SMB/VPN.
+- **Volume:** about 1,000 shares of about 1,000 files each to start (10⁶ files). The design must
+  also handle 10⁸–10⁹ files (D3). The shares are deep, messy, and often reached over SMB/VPN.
 - **Implicit metadata:** the meaning sits in *paths and filenames*. Examples:
   `\\fs01\Projects\P1234 Riverside\05 Shared\Architecture\P1234-ARP-ZZ-01-DR-A-1001_C02.pdf`
   carries the project, the CDE state, the discipline, ISO 19650 fields and a revision.
@@ -41,7 +53,7 @@ flowchart LR
     ENGINE["Engine<br/>graph validation · DAG executor · caching"]
     REG["Node registry<br/>entry-point plugins + JSON Schema"]
     NODES["Nodes<br/>sources · parsers · transforms · sinks"]
-    STORE[("Store<br/>SQLite (→ Postgres)")]
+    STORE[("Store<br/>SQLite: control state<br/>Parquet + DuckDB: data")]
   end
 
   FS[["Network shares<br/>(UNC / SMB)"]]
@@ -147,22 +159,25 @@ filetra/
 │  │  ├─ executor.py           # topological run, per-node caching, cancellation, events
 │  │  └─ provenance.py         # Assertion model, precedence/reconciliation
 │  ├─ store/
-│  │  ├─ base.py               # repository interface
-│  │  ├─ sqlite.py             # default store (WAL mode)
+│  │  ├─ base.py               # repository interfaces (control store, dataset store)
+│  │  ├─ control_sqlite.py     # shares, runs, graphs, cache index, scan checkpoints
+│  │  ├─ datasets.py           # partitioned Parquet datasets (per share), DuckDB views
 │  │  └─ migrations/
 │  ├─ nodes/                   # built-in nodes, registered exactly like third-party ones
+│  │  ├─ sources/share_inventory.py # the list of shares (CSV) → Locations
 │  │  ├─ sources/fs_scan.py
 │  │  ├─ sources/listing_file.py   # import a saved listing (dir /s, CSV) for offline work
 │  │  ├─ parse/path_segments.py
-│  │  ├─ parse/naming_convention.py
+│  │  ├─ parse/naming_convention.py # dispatches to a NamingConvention module
 │  │  ├─ parse/revision.py
 │  │  ├─ transform/codelist_map.py
 │  │  ├─ transform/tag_rules.py
 │  │  ├─ transform/group_documents.py
 │  │  ├─ transform/reconcile.py
 │  │  ├─ aggregate/summary.py
-│  │  └─ sinks/{csv,excel,store}.py
-│  ├─ conventions/             # presets as data: iso19650.yaml, revision schemes, code lists
+│  │  └─ sinks/{csv,jsonl,json,parquet,excel}.py
+│  ├─ conventions/             # NamingConvention modules (iso19650.py, …), revision schemes, code lists
+│  │                           #   later: data-driven conventions (yaml) as another implementation
 │  ├─ api/                     # FastAPI app: catalog, graphs, runs, results, events
 │  └─ cli.py                   # Typer: scan, run, nodes, serve, validate
 ├─ web/                        # TypeScript SPA (separate package.json, built to static files)
@@ -274,6 +289,15 @@ A firm-specific package (`filetra-acme`) adds nodes and conventions without fork
 ### 4.4 Executor
 
 - Topological execution of a DAG, with cycle detection during validation.
+- **Partitioned execution (D3).** Data is partitioned **by share**. Each node declares whether it is
+  `partition_local` or `global`:
+  - `partition_local` nodes, such as scan, path parsing and naming parsing, run per share. They
+    run in parallel, use bounded memory, and only re-run for shares whose input changed.
+  - `global` nodes, such as grouping documents across shares, cross-share duplicates and
+    aggregates, run over the whole dataset. They use lazy Polars/DuckDB queries over Parquet, so
+    they don't need everything in RAM.
+
+  Most of the work is partition-local. That is what makes 10⁸+ files feasible on one machine.
 - **Per-node caching:** the cache key is a hash of the node type and version, its config, and the
   cache keys of its inputs. Re-running after a regex change only recomputes downstream nodes, which
   makes a live "preview this node" in the GUI practical.
@@ -309,19 +333,67 @@ Mitigation: assertions are the *audit store*, and query-facing tables are materi
 projections, rebuilt incrementally. Without provenance, users can't trust or debug the results,
 and in this domain trust is what decides adoption.
 
-### 4.6 Storage
+### 4.6 Storage (revised for D3 scale)
 
-| Option | Use |
-|---|---|
-| **SQLite (WAL)** ✓ default | Zero administration, a single file per workspace, enough for 10⁷ rows. **Never place it on a network share** (SMB locking is unreliable), only on local disk or the server. |
-| **DuckDB** | Excellent for analytical queries and exports. Polars can query it directly. Writes come from a single process. Use it as an *analytical sidecar* or export format, not as the system of record. |
-| **PostgreSQL** | Server or multi-user mode later. Hide it behind the `store` interface (SQLAlchemy Core keeps the SQL portable). |
+The original "SQLite for everything" plan works at 10⁶ rows but not at 10⁹. At that size the
+rows plus indexes would take hundreds of GB, and every rescan would rewrite them. The store is
+therefore split into two planes:
+
+| Plane | Technology | Holds |
+|---|---|---|
+| **Control** | **SQLite (WAL)**, small | The share inventory, scan checkpoints and status per share, runs, graphs, the node-cache index, code lists |
+| **Data** | **Parquet datasets partitioned by share** (`data/<dataset>/share=<id>/part-*.parquet`), queried with **DuckDB/Polars lazily** | File listings, parsed fields, assertions, documents/revisions, aggregates |
+
+**Change history without a full copy per scan.** Each share partition holds the *current state*
+plus an **append-only change log**: added, removed, modified and moved files, each with a scan
+id. History can be rebuilt by replaying the log (a slowly-changing-dimension pattern). A full
+snapshot per scan is never stored.
+
+**Why this fits:**
+- Paths compress extremely well in Parquet thanks to dictionary encoding and zstd. Directory
+  prefixes repeat heavily, so 10⁹ rows are realistic on a workstation disk.
+- Partitioning per share matches both the scan unit and the unit of incremental recompute. A
+  changed share only rewrites its own partition.
+- DuckDB queries across all partitions with SQL, and it is also the engine behind result-grid
+  paging and filtering.
+
+**Critique:**
+- There are two stores to keep consistent. Mitigation: a partition write is atomic (write to a
+  temporary location, then rename), and it is committed in SQLite only after the rename. On
+  startup, any partition that isn't in the control store is ignored and garbage-collected.
+- Parquet files are immutable, so a "small edit" such as a manual tag means rewriting a whole
+  partition. Mitigation: keep user edits (manual tags, overrides) in SQLite as a small overlay that
+  is joined at query time.
+- Neither the SQLite file nor the Parquet store may live on a network share. They go on local disk
+  only.
+- **PostgreSQL** is still the route to multi-user later. The Parquet data plane can stay as it is
+  (or move to object storage). Only the control plane moves.
+
+### 4.7 Outputs (D5)
+
+| Sink | Format | Notes |
+|---|---|---|
+| `csv` ✓ | UTF-8 with BOM (so Excel opens it correctly), RFC 4180 quoting | Human-friendly. One file per table, optionally one per share. |
+| `jsonl` ✓ | JSON Lines | Machine-friendly and streamable at any size. The preferred machine export. |
+| `json` | A single document (nested: document → revisions → renditions) | Convenient for small, filtered results only. Refuses to run above a configurable row limit. |
+| `parquet` | Columnar | For large volumes or for Power BI, pandas, DuckDB and similar tools. |
+| `excel` | xlsx | Only for filtered views. **Hard limit of 1,048,576 rows**, so the sink fails clearly instead of truncating. |
+
+Every export also writes a small `manifest.json` next to the data. It records the graph, the node
+versions, the run id, the time, the row counts and the source shares, so any CSV can be traced
+back to how it was produced.
 
 ---
 
 ## 5. First source: file-system scan (specifics)
 
-The hard parts here are operational, not algorithmic:
+The hard parts here are operational, not algorithmic.
+
+**Read-only by construction (D4).** Sources receive a narrow `ReadOnlyFS` interface (`scandir`,
+`stat`, `open_read`), never `pathlib.Path` or `os` directly. Nothing in the engine opens files on
+a share for writing. Note that a scan never changes access times either, because we only list
+and stat files and never read their content unless hashing is turned on. A test asserts that no
+built-in node imports write-capable file-system APIs for share paths.
 
 - **Scale and latency:** walk directories in parallel with a thread pool (`os.scandir`), producing
   chunks of about 50k rows, so memory stays flat and progress can be streamed.
@@ -350,19 +422,66 @@ The meaning comes from three places, and each one gets a dedicated node:
    validation. It emits **partial results, a confidence and reasons**, and *never drops rows*.
    Non-conforming names go to a `rejects` output, and reviewing that output is a core user
    workflow, not an edge case.
+
+   Per **D2**, the node delegates to a **`NamingConvention` protocol**, so fixed modules come
+   first and configurable ones later without changing anything else:
+
+   ```python
+   class ParseResult(NamedTuple):
+       fields: dict[str, str]          # {"project": "P1234", "originator": "ARP", …}
+       confidence: float               # 0..1
+       issues: list[str]               # ["role 'X' not in code list", …]
+
+   class NamingConvention(Protocol):
+       id: str                         # "iso19650", "acme-2019", "client-xyz"
+       version: int
+       field_names: tuple[str, ...]    # fixes the output schema up front
+       def parse(self, name: str, path_fields: Mapping[str, str]) -> ParseResult: ...
+   ```
+
+   - **Phase 0:** hand-written modules (`iso19650`, plus one or two real company/client
+     conventions as examples), registered through the same entry-point mechanism as nodes.
+   - **Later:** a `DeclarativeConvention` that loads YAML (fields, delimiters, code lists,
+     regexes), which the GUI convention builder edits. It's just another implementation.
+   - **Selecting a convention per share/project:** a rule table (`share or path pattern →
+     convention id`) lets different projects and clients use different conventions in one run.
+     It can also try several conventions and keep the result with the highest confidence.
 3. **Revision** (`revision`): extracts the revision and status from a suffix, brackets or a
    register. **Revision schemes are pluggable comparators**: ISO 19650 (P01 < P02 < C01), alpha
    (A < B … Z < AA), numeric and firm-specific. Sequence order and status semantics (preliminary
    vs contractual) belong to the scheme.
 
-Conventions ship as **data** (`conventions/*.yaml`), not code. A firm can then encode its own
-standard without writing Python, and the GUI can edit them.
+The longer-term goal (after D2's fixed modules) is to ship conventions as **data**. A firm can
+then encode its own standard without writing Python, and the GUI can edit it.
 
 *Critique:* naming conventions are applied inconsistently in practice. Regex-per-field is
 brittle, so add a fallback tokeniser (split on `-`, `_` and spaces, then fuzzy-match tokens to code
 lists) that produces lower-confidence assertions. Don't attempt ML or LLM classification until the
 deterministic pipeline and the reject-review workflow exist. When it comes, it is just another
 node that emits low-confidence assertions.
+
+### 5.2 Share inventory and scan orchestration (D3)
+
+With about 1,000 shares, the *list of shares* is data in its own right:
+
+- **Input:** `shares.csv` (`share_id, unc_root, project, client, convention, enabled, tags`).
+  Loading it with the `share_inventory` source creates or updates Locations in the control store.
+  This is also where the convention is assigned to each share (D2).
+- **Scheduling:** a scan queue with a **global concurrency limit** and a **limit per file
+  server**. Many shares usually live on a handful of servers, and hammering one filer with 64
+  parallel walks hurts the scan and other users. Both limits are configurable.
+- **Resilience:** each share has its own status (`ok / partial / denied / unreachable`), last
+  successful scan time, duration and counts. Failures are retried with backoff, and a share that
+  fails never blocks the others. A scan is **resumable**: a checkpoint per share records completed
+  top-level directories, so an interrupted 10⁸-file run doesn't start from zero.
+- **Throughput:** expect about 1–5k entries/s per walker thread over SMB on a LAN, and much less
+  over VPN. 10⁶ files then takes minutes to tens of minutes on a workstation. At 10⁸–10⁹, a full
+  rescan takes hours to days, so at that scale:
+  1. incremental rescans (prioritise recently changed shares, and use the directory-mtime
+     heuristic) are essential;
+  2. running the scanner *near the data* (server mode, §6 mode A) becomes the correct deployment
+     even for a single user. The engine is the same and only its location changes. This is the
+     main reason to keep the GUI/engine split strict even though there is only one user today.
 
 ---
 
@@ -379,8 +498,14 @@ every deployment option below open, with **no code changes** between them.
 | **C. Desktop via Tauri + Python sidecar** | A Rust shell bundles the SPA and launches the frozen backend as a sidecar | Polished installer, auto-update, small footprint | Three toolchains (Rust, Node, Python) plus sidecar lifecycle management. Worth it only once B hits its limits. |
 | **D. Electron + sidecar** | As C, with Chromium bundled | Most mature | Large (150 MB+) and still needs the Python sidecar. No advantage over C here. |
 
-**Recommendation:** design for A and B from the start, because they are the same artifact. Treat
-C as an upgrade path. Whichever mode is used, the local API must bind to loopback only and require
+**Recommendation (updated for D1):** ship **B (pywebview desktop) first**, because the tool is for a
+single user and runs with that user's own share permissions. Keep A working as a byproduct, since
+it is the same artifact: a headless `filetra serve` on a machine near the file servers, for the
+scale case in §5.2. Treat C as an upgrade path. Before any multi-user rollout, A needs auth and
+permission scoping.
+
+During development and for early use, you don't need any packaging. Run `uv run filetra serve`
+and open the browser. Whichever mode is used, the local API must bind to loopback only and require
 a token, because otherwise any web page could call a localhost file-system API.
 
 ---
@@ -406,12 +531,13 @@ GET  /api/entities/{id}/provenance  assertions behind each value
 
 | Phase | Deliverable | Why this order |
 |---|---|---|
-| **0. Core + CLI** | model, protocols, registry, graph and executor, SQLite store; nodes `fs_scan`, `listing_file`, `path_segments`, `naming_convention` (ISO 19650 preset), `revision`, `group_documents`, CSV/Excel sinks; `filetra run graph.json` | Tests the hardest assumption, *can we infer reliable metadata from real paths?*, with real data before any GUI investment |
+| **0. Core + CLI** | model, protocols, registry, graph and partitioned executor, SQLite control store plus Parquet datasets; nodes `share_inventory`, `fs_scan` (read-only, resumable, concurrency-limited), `listing_file`, `path_segments`, `naming_convention` with **fixed modules** (ISO 19650 + one real company convention), `revision`, `group_documents`; **CSV / JSONL / JSON** sinks with manifest; `filetra run graph.json`; a synthetic generator that builds 10⁶–10⁸-row listings for load tests | Tests the hardest assumption, *can we infer reliable metadata from real paths?*, with real data before any GUI investment. It also proves the D3 scale path early. |
 | **1. API** | FastAPI over the engine: catalog, runs, results, convention tester, events | Makes the contract concrete. OpenAPI then generates the TS types. |
 | **2. Web UI: results first** | results grid with filters, a provenance drawer, a rejects review, a naming-convention builder and tester | Highest user value, and needs no graph editor |
 | **3. Web UI: graph editor** | React Flow canvas driven by `/catalog`, schema-generated config forms, per-node preview | Built once nodes and contracts have stabilised |
-| **4. More sources and enrichment** | Excel drawing registers, PDF title-block extraction, CDE APIs (ACC/BIM 360, Aconex, Viewpoint, SharePoint), IFC/DWG properties, tag rules, reconciliation, dashboards | Each is just a new node |
-| **5. Deployment and multi-user** | service mode with auth, Postgres, pywebview desktop build, scheduling and change notifications | Packaging comes last, when there is something worth packaging |
+| **4. Configurable conventions and enrichment** | `DeclarativeConvention` (YAML) + GUI convention builder (D2); Excel drawing registers, PDF title-block extraction, IFC/DWG properties, tag rules, reconciliation, dashboards | Each is just a new node or convention implementation |
+| **5. Packaging** | pywebview desktop build (D1), signed; `filetra serve` documented for running near the data | Packaging comes last, when there is something worth packaging |
+| **6. (If needed) multi-user** | auth, permission scoping, Postgres control plane, CDE API sources | Only if D1 changes |
 
 ---
 
@@ -421,18 +547,17 @@ GET  /api/entities/{id}/provenance  assertions behind each value
 |---|---|
 | Building a visual programming environment absorbs the project | Results-first UI, coarse nodes and preset pipelines. The graph editor is phase 3. |
 | Real-world filenames are messier than any convention | Partial parsing, confidence scores, a rejects workflow and a fuzzy fallback. Measure the parse rate on real shares in phase 0. |
-| Network scan performance and permissions | Run near the data (server mode), parallel walk, chunked snapshots, resilient error handling. |
-| Data exposure through a privileged service account | Per-user root scoping or permission mapping before multi-user rollout. |
+| Network scan performance and permissions | Parallel walk, limits per server, resumable checkpoints per share, incremental rescans, and running near the data at large scale (§5.2). |
+| Scale is out by orders of magnitude (D3) | Partitioned Parquet with lazy queries from day one, plus a synthetic 10⁸-row load test in phase 0, so the limits are measured instead of assumed. |
+| Data exposure through a privileged service account | Not an issue for a single desktop user (D1). Needs per-user root scoping before any multi-user rollout. |
 | Saved graphs break as nodes evolve | Node versioning and config migrations from day one. |
 | Packaging friction in corporate IT (AV, signing, admin rights) | Server mode first. Sign desktop builds. Install per user with no admin rights. |
 
-**Questions for you:**
-1. Single user on a workstation, or a shared server per office/firm? This decides whether phase 5
-   starts with A or B.
-2. Which naming standards are in scope beyond ISO 19650 (firm-specific, client-specific,
-   legacy BS 1192, US NCS)?
-3. Rough scale: the number of files per project share and the number of shares?
-4. Is write-back in scope (renaming or moving files, stamping metadata), or is the tool strictly
-   read-only? I recommend **read-only** for safety until the inference is trusted.
-5. Must outputs go to existing systems (CDE, ERP, Power BI), which affects which sinks get
-   priority?
+**Open questions** (they don't block phase 0):
+1. Which one or two real company/client naming conventions should be the first fixed modules
+   besides ISO 19650? A sample of real filenames (anonymised if needed) would make the best test
+   fixtures.
+2. Where does the list of about 1,000 shares come from today: a spreadsheet, DFS namespace,
+   AD/LDAP, or a project database? This decides how `share_inventory` gets its input.
+3. Is content hashing (for duplicate and move detection) wanted, given its cost over SMB, or are
+   size, mtime and name enough?
