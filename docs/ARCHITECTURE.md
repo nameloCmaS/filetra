@@ -15,6 +15,7 @@ also reviews each choice critically.
 | D3 | Scale | **Thousands of projects × about 1,000 files ≈ 10⁶ files at the start**, possibly 10⁸–10⁹ later. They sit on **only one or two shares**, so a project is a folder (or folders) on a share, not a share. | Storage moves to **partitioned Parquet with DuckDB/Polars** for the data and SQLite for control state (§4.6). Execution is **partitioned per project** (§4.4). **Project discovery** is a first-class part of the design (§5.2). Because everything is on one or two file servers, how hard the scanner hits each server matters more than the total parallelism. Excel can't be a primary output because of its 1,048,576-row limit. |
 | D4 | Write-back | **Read-only.** | This is enforced by design. Sources only get a read-only file-system interface, and nothing in the engine opens files on a share for writing (§5). |
 | D6 | Hashing | **No content hashing for now.** Only the metadata that is cheap to collect. | The scan collects only what a directory listing and stat give: name, path, is_dir, size, mtime, ctime, extension and Windows attributes. No file content is read, so the scan never touches access times. Move detection uses size, mtime and name only (§5). Hashing stays a possible later add-on node. |
+| D7 | Project folder names | **A customisable template system: regex with named groups, stored as JSON for now.** | A small, reusable **pattern-template engine** (§5.3) extracts key data such as the project number, name and client from project folder names. Templates are data, not code, and carry their own test examples. The same engine is designed for reuse later by `path_segments` and by data-driven naming conventions (D2). |
 | D5 | Outputs | **Easy human/machine-readable formats** (CSV, JSON). | The primary sinks are **CSV, JSON Lines and JSON**. Parquet is the internal format and an optional export. Excel is a convenience sink for small filtered views only (§4.7). |
 
 ---
@@ -159,7 +160,8 @@ filetra/
 │  │  ├─ registry.py           # @node decorator, entry-point discovery, catalog export
 │  │  ├─ graph.py              # graph document model (pydantic) + validation
 │  │  ├─ executor.py           # topological run, per-node caching, cancellation, events
-│  │  └─ provenance.py         # Assertion model, precedence/reconciliation
+│  │  ├─ provenance.py         # Assertion model, precedence/reconciliation
+│  │  └─ templates.py          # pattern-template engine: JSON load, regex compile, match, format (§5.3)
 │  ├─ store/
 │  │  ├─ base.py               # repository interfaces (control store, dataset store)
 │  │  ├─ control_sqlite.py     # roots, projects, runs, graphs, cache index, scan checkpoints
@@ -179,7 +181,8 @@ filetra/
 │  │  ├─ aggregate/summary.py
 │  │  └─ sinks/{csv,jsonl,json,parquet,excel}.py
 │  ├─ conventions/             # NamingConvention modules (iso19650.py, …), revision schemes, code lists
-│  │                           #   later: data-driven conventions (yaml) as another implementation
+│  │                           #   later: data-driven conventions (JSON templates) as another implementation
+│  ├─ templates/               # example template files: projects.example.json
 │  ├─ api/                     # FastAPI app: catalog, graphs, runs, results, events
 │  └─ cli.py                   # Typer: scan, run, nodes, serve, validate
 ├─ web/                        # TypeScript SPA (separate package.json, built to static files)
@@ -457,7 +460,8 @@ The meaning comes from three places, and each one gets a dedicated node:
    (A < B … Z < AA), numeric and firm-specific. Sequence order and status semantics (preliminary
    vs contractual) belong to the scheme.
 
-The longer-term goal (after D2's fixed modules) is to ship conventions as **data**. A firm can
+The longer-term goal (after D2's fixed modules) is to ship conventions as **data**, using the same
+JSON pattern-template engine as project folders (§5.3). A firm can
 then encode its own standard without writing Python, and the GUI can edit it.
 
 *Critique:* naming conventions are applied inconsistently in practice. Regex-per-field is
@@ -471,18 +475,17 @@ node that emits low-confidence assertions.
 Thousands of projects live as folders on **one or two shares**. The *list of projects* is data
 in its own right, and it is **discovered from the folder structure**, not maintained by hand:
 
-- **Roots:** a short config list of UNC roots, e.g. `\\fs01\Projects`. Each root carries a
-  **project rule** that says where project folders sit and how to read them. Examples:
-  - "every folder at depth 1 matching `^(?P<number>\d{4,6})[ _-]+(?P<name>.+)$` is a project";
-  - "depth 2 under `\<client>\<project>`", so the client comes from the parent folder.
-
-  Folders that don't match are reported as *unclassified* rather than silently skipped.
+- **Roots and templates (D7):** a JSON file lists the UNC roots, e.g. `\\fs01\Projects`, and the
+  **project templates** that apply to each root. A template says at which depth project folders
+  sit and extracts key data from their names with regex named groups (§5.3). Folders that match
+  no template are reported as *unclassified* rather than silently skipped.
 - **`project_discovery` source:** lists only the top levels of each root, which is cheap, and
-  applies the rules. It creates or updates **Projects** in the control store with id, number,
-  name, client, folder(s), first seen and last seen. Projects that disappear are marked
-  *missing*, never deleted. An **optional override CSV** (`project_number, convention, enabled,
-  tags, extra_folders`) handles exceptions, such as a project split across two roots, disabling an
-  archive, or assigning a client's naming convention (D2).
+  applies the templates. It creates or updates **Projects** in the control store with id, the
+  extracted fields (number, name, client, …), folder(s), the id of the template that matched,
+  first seen and last seen. Projects that disappear are marked *missing*, never deleted. An
+  **optional override** section in the same JSON (keyed by project id: `convention`, `enabled`,
+  `tags`, `extra_folders`) handles exceptions, such as a project split across two roots,
+  disabling an archive, or assigning a client's naming convention (D2).
 - **Scheduling:** the scan unit is **one project**. Everything sits on one or two file servers,
   so the important control is a **concurrency limit per file server**, defaulting to something
   modest like 8–16 parallel walkers and configurable. That is what keeps the scan from degrading
@@ -506,6 +509,102 @@ in its own right, and it is **discovered from the folder structure**, not mainta
      §6 mode A) becomes the right deployment even for a single user. The engine is the same and
      only its location changes. This is the main reason to keep the GUI/engine split strict even
      though there is only one user today.
+
+### 5.3 Pattern templates (D7)
+
+One small engine, `core/templates.py`, turns *names* into *fields* using user-editable regex
+templates. Phase 0 uses it for project folders. The same engine is designed to back
+`path_segments` and, later, data-driven naming conventions, so users learn one mechanism.
+
+**File format** (`filetra.templates/1`, JSON):
+
+```json
+{
+  "format": "filetra.templates/1",
+  "roots": [
+    {
+      "id": "fs01-projects",
+      "path": "\\\\fs01\\Projects",
+      "templates": ["numbered", "client-numbered"],
+      "exclude": ["^_", "^~", "^(Archive|Templates|Admin)$"]
+    }
+  ],
+  "templates": [
+    {
+      "id": "numbered",
+      "description": "12345 Project Name",
+      "levels": [
+        { "pattern": "(?P<project_number>\\d{4,6})[ _-]+(?P<project_name>.+)" }
+      ],
+      "fields": {
+        "project_id": "{project_number}",
+        "project_name": "{project_name|strip}"
+      },
+      "examples": [
+        { "path": "12345 Riverside Tower",
+          "expect": { "project_id": "12345", "project_name": "Riverside Tower" } },
+        { "path": "Admin", "expect": null }
+      ]
+    },
+    {
+      "id": "client-numbered",
+      "description": "Client\\12345 - Project Name",
+      "levels": [
+        { "pattern": "(?P<client>[A-Za-z][\\w &.-]*)" },
+        { "pattern": "(?P<project_number>\\d{4,6})\\s*-\\s*(?P<project_name>.+)" }
+      ],
+      "fields": {
+        "project_id": "{client|upper}-{project_number}",
+        "client": "{client|strip}"
+      }
+    }
+  ],
+  "overrides": {
+    "12345": { "convention": "iso19650", "tags": ["live"] }
+  }
+}
+```
+
+**Semantics:**
+- **`levels`:** one pattern per folder depth below the root. The project folder is the last
+  level. Patterns use Python `re` syntax and are matched with **`fullmatch`**, so no `^…$` is
+  needed and partial matches can't slip through. Named groups from all levels are merged; a
+  duplicate group name across levels is a load error.
+- **`flags`** (optional, per template): `ignore_case`, which is on by default because Windows names
+  are case-insensitive.
+- **`fields`:** output fields built from groups with `{group}` placeholders and a *small fixed
+  set* of filters: `upper`, `lower`, `strip`, `title`, `zfill:N`, `replace:a:b`. **`project_id`
+  is required.** If a field isn't listed, every named group is passed through unchanged.
+- **Matching order:** a root's templates are tried in the listed order and the first match wins.
+  If a later template would also match, a warning is recorded, which catches overlapping
+  templates early. No match → *unclassified*.
+- **`exclude`:** regexes for folder names to skip at any level, such as admin or archive folders.
+- **Provenance:** each extracted field is recorded as an assertion with `source = template:<id>`
+  and confidence 1.0, consistent with §4.5.
+
+**Validation and testing:**
+- A JSON Schema for the file is generated from the pydantic models. Editors such as VS Code then
+  give autocomplete and validation while the file is edited by hand, and the future GUI gets its
+  form from the same schema.
+- At load time every regex is compiled, and each `{placeholder}` must refer to a named group that
+  exists. Errors name the template id and the offending pattern.
+- **`examples` are executable tests.** `filetra templates test templates.json` runs them, and
+  `filetra templates try templates.json "\\fs01\Projects\12345 Riverside"` shows which template
+  matched, the extracted fields and why other templates didn't match. `filetra templates report`
+  runs the templates against a live root (top levels only) and lists the match count per
+  template and every unclassified folder. This loop is how users tune the templates.
+
+**Critique:**
+- *Regex in JSON is unpleasant:* every backslash must be doubled (`\\d`). The mitigations are the
+  `try`/`test` commands, which surface mistakes immediately, and the later GUI editor, which hides
+  the escaping. If hand-editing stays common, a later option is a simpler placeholder syntax that
+  compiles to regex, such as `"{project_number:\\d{5}} {project_name}"`. JSON5 or YAML could also
+  be accepted as alternative file formats with no change to the engine.
+- *Templates can grow into a programming language:* the filter set is deliberately small and
+  closed. Anything more complex belongs in a Python plugin node, not in the template.
+- *Regex performance* doesn't matter here. Thousands of project folders is trivial, and even
+  10⁸ filenames is fine with precompiled patterns applied as vectorised Polars
+  `str.extract_groups` where possible.
 
 ---
 
@@ -555,7 +654,7 @@ GET  /api/entities/{id}/provenance  assertions behind each value
 
 | Phase | Deliverable | Why this order |
 |---|---|---|
-| **0. Core + CLI** | model, protocols, registry, graph and partitioned executor, SQLite control store plus Parquet datasets; nodes `project_discovery`, `fs_scan` (read-only, resumable, concurrency-limited), `listing_file`, `path_segments`, `naming_convention` with a **fixed module** (ISO 19650; more modules later), `revision`, `group_documents`; **CSV / JSONL / JSON** sinks with manifest; `filetra run graph.json`; a synthetic generator that builds 10⁶–10⁸-row listings for load tests | Tests the hardest assumption, *can we infer reliable metadata from real paths?*, with real data before any GUI investment. It also proves the D3 scale path early. |
+| **0. Core + CLI** | model, protocols, registry, graph and partitioned executor, SQLite control store plus Parquet datasets; pattern-template engine + `filetra templates test/try/report`; nodes `project_discovery` (JSON templates), `fs_scan` (read-only, resumable, concurrency-limited), `listing_file`, `path_segments`, `naming_convention` with a **fixed module** (ISO 19650; more modules later), `revision`, `group_documents`; **CSV / JSONL / JSON** sinks with manifest; `filetra run graph.json`; a synthetic generator that builds 10⁶–10⁸-row listings for load tests | Tests the hardest assumption, *can we infer reliable metadata from real paths?*, with real data before any GUI investment. It also proves the D3 scale path early. |
 | **1. API** | FastAPI over the engine: catalog, runs, results, convention tester, events | Makes the contract concrete. OpenAPI then generates the TS types. |
 | **2. Web UI: results first** | results grid with filters, a provenance drawer, a rejects review, a naming-convention builder and tester | Highest user value, and needs no graph editor |
 | **3. Web UI: graph editor** | React Flow canvas driven by `/catalog`, schema-generated config forms, per-node preview | Built once nodes and contracts have stabilised |
@@ -578,7 +677,4 @@ GET  /api/entities/{id}/provenance  assertions behind each value
 | Packaging friction in corporate IT (AV, signing, admin rights) | Use `uv run filetra serve` plus a browser until phase 5. Then sign desktop builds and install per user with no admin rights. |
 
 **Open questions** (they don't block phase 0):
-1. What do project folder names look like at the root, e.g. `12345 Project Name`, or
-   `Client\12345 - Name`? A handful of real examples (anonymised) would define the first
-   `project_discovery` rule.
-2. (Deferred) Which company/client naming conventions should follow ISO 19650 as fixed modules?
+1. (Deferred) Which company/client naming conventions should follow ISO 19650 as fixed modules?
