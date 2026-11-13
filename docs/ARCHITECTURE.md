@@ -14,10 +14,11 @@ also reviews each choice critically.
 | D2 | Naming conventions | **Fixed naming modules first.** Configurable company/project/client conventions come later. | Naming parsers sit behind a `NamingConvention` protocol (§5.1). Phase 0 ships hand-written modules (ISO 19650 and others). A data-driven, GUI-editable convention is added later as just another implementation of the same protocol. |
 | D3 | Scale | **Thousands of projects × about 1,000 files ≈ 10⁶ files at the start**, possibly 10⁸–10⁹ later. They sit on **only one or two shares**, so a project is a folder (or folders) on a share, not a share. | Storage moves to **partitioned Parquet with DuckDB/Polars** for the data and SQLite for control state (§4.6). Execution is **partitioned per project** (§4.4). **Project discovery** is a first-class part of the design (§5.2). Because everything is on one or two file servers, how hard the scanner hits each server matters more than the total parallelism. Excel can't be a primary output because of its 1,048,576-row limit. |
 | D4 | Write-back | **Read-only.** | This is enforced by design. Sources only get a read-only file-system interface, and nothing in the engine opens files on a share for writing (§5). |
+| D5 | Outputs | **Easy human/machine-readable formats** (CSV, JSON). | The primary sinks are **CSV, JSON Lines and JSON**. Parquet is the internal format and an optional export. Excel is a convenience sink for small filtered views only (§4.7). |
 | D6 | Hashing | **No content hashing for now.** Only the metadata that is cheap to collect. | The scan collects only what a directory listing and stat give: name, path, is_dir, size, mtime, ctime, extension and Windows attributes. No file content is read, so the scan never touches access times. Move detection uses size, mtime and name only (§5). Hashing stays a possible later add-on node. |
 | D7 | Project folder names | **A customisable template system: regex with named groups, stored as YAML (D8).** | A small, reusable **pattern-template engine** (§5.3) extracts key data such as the project number, name and client from project folder names. Templates are data, not code, and carry their own test examples. The same engine is designed for reuse later by `path_segments` and by data-driven naming conventions (D2). |
-| D8 | Configuration format | **All configuration files are YAML.** | Pipeline graphs (§4.3), pattern templates (§5.3), overrides and app settings are all `.yaml`. Loading is strict so that YAML's implicit typing can't corrupt values (§4.8). JSON stays only where it isn't configuration: HTTP API payloads, `json`/`jsonl` exports and the export `manifest.json`. JSON *Schema* is still generated from the pydantic models and validates the YAML files. |
-| D5 | Outputs | **Easy human/machine-readable formats** (CSV, JSON). | The primary sinks are **CSV, JSON Lines and JSON**. Parquet is the internal format and an optional export. Excel is a convenience sink for small filtered views only (§4.7). |
+| D8 | Configuration format | **All configuration files are YAML.** | Pipelines (§4.3), pattern templates (§5.3), overrides and app settings are all `.yaml`. Loading is strict so that YAML's implicit typing can't corrupt values (§4.8). JSON stays only where it isn't configuration: HTTP API payloads, `json`/`jsonl` exports and the export `manifest.json`. JSON *Schema* is still generated from the pydantic models and validates the YAML files. |
+| D9 | Visual programming | **Dropped.** There is no node-based visual editor. | Pipelines are YAML files, written by hand or shipped as presets (§4.3). The GUI covers only operating the tool and reviewing results: projects and scan status, the results grid, the rejects review and template testing (§3.2). Without a graph canvas there's no reason to build a TypeScript front end, so the GUI moves to **Python (NiceGUI)** behind the same HTTP API. The Total.js, React Flow and similar comparisons are removed. |
 
 ---
 
@@ -35,9 +36,9 @@ also reviews each choice critically.
 - **Enrichment:** tags, mapping to code lists and registers, aggregation (latest revision per
   document, counts per discipline/status, register vs disk reconciliation).
 - **Extensibility:** many specialised functions (extractors, parsers, mappers) need a common
-  typed contract, so they can be composed. In the end they are composed visually.
-- **Constraints:** Python is preferred. A GUI is the end goal, ideally node-based visual
-  programming. The GUI and processing must stay separate. The backend must read file systems, so a
+  typed contract, so they can be composed into pipelines.
+- **Constraints:** Python is preferred. A GUI is the end goal (without visual programming, D9).
+  The GUI and processing must stay separate. The backend must read file systems, so a
   pure-browser app is not an option.
 
 ---
@@ -47,15 +48,15 @@ also reviews each choice critically.
 ```mermaid
 flowchart LR
   subgraph Clients
-    WEB["Web UI (TypeScript SPA)<br/>graph editor · results grid · rule tester"]
+    GUI["GUI (NiceGUI, Python)<br/>projects · results grid · rejects · template tester"]
     CLI["CLI (filetra …)"]
     SCHED["Scheduler<br/>(cron / Task Scheduler)"]
   end
 
   subgraph Backend["Python backend (headless)"]
     API["HTTP API (FastAPI)<br/>REST + WebSocket events"]
-    ENGINE["Engine<br/>graph validation · DAG executor · caching"]
-    REG["Node registry<br/>entry-point plugins + JSON Schema"]
+    ENGINE["Engine<br/>pipeline validation · DAG executor · caching"]
+    REG["Node registry<br/>entry-point plugins"]
     NODES["Nodes<br/>sources · parsers · transforms · sinks"]
     STORE[("Store<br/>SQLite: control state<br/>Parquet + DuckDB: data")]
   end
@@ -63,7 +64,7 @@ flowchart LR
   FS[["Network shares<br/>(UNC / SMB)"]]
   EXT[["Registers (xlsx), CDEs,<br/>PDF title blocks, IFC …"]]
 
-  WEB -- "HTTP/JSON (OpenAPI-typed)" --> API
+  GUI -- "HTTP/JSON (typed client)" --> API
   CLI --> ENGINE
   SCHED --> CLI
   API --> ENGINE
@@ -78,15 +79,16 @@ The principles below drive everything else:
 1. **The engine is a headless Python library.** The CLI and the HTTP API are thin shells over it.
    The GUI is one client among several. Every engine feature can be used and tested without a
    GUI.
-2. **The pipeline graph is a document (YAML on disk), and that document is the contract.** The GUI edits
-   the graph document and the engine executes it. Neither side needs the other's code. Graphs can
-   be versioned in git, diffed and run headless on a schedule.
-3. **Nodes describe themselves.** Each node type publishes its ports, its port types and a
-   JSON Schema for its configuration. The GUI builds its palette and config forms from that
-   description, the same way ComfyUI does. Adding a node therefore never needs a GUI change.
+2. **A pipeline is a YAML document.** It lists the nodes and how their inputs and outputs connect,
+   and the engine executes it. Pipelines are written by hand or copied from shipped presets, and
+   can be versioned in git, diffed and run headless on a schedule. There is no visual editor (D9).
+3. **Nodes describe themselves.** Each node type publishes its inputs, outputs, their table types
+   and a schema for its configuration. That description drives pipeline validation, `filetra nodes`
+   (a CLI listing of every node and its settings), generated reference docs, and editor
+   autocomplete for pipeline YAML.
 4. **Data moves as tables, not as messages.** Nodes exchange columnar tables (Polars/Arrow) with
    declared schemas, not per-row messages. That choice is what makes 10⁶+ rows practical and lets
-   the GUI preview the output of any node.
+   you preview the output of any node (`filetra run pipeline.yaml --until <node> --head 100`).
 5. **Every value records where it came from.** Each derived attribute records which node, rule
    and source produced it, plus a confidence. Conflicts between sources (filename vs register vs
    title block) are resolved explicitly, never silently.
@@ -110,39 +112,50 @@ The principles below drive everything else:
   the part that changes most: domain rules. The scan is bound by network latency, not CPU, so the
   speed gain is small. *Kept in reserve:* if profiling ever shows a hot path (such as hashing or
   scanning), write a PyO3 extension for just that path.
-- **TypeScript/Node end-to-end** (which would pair naturally with Total.js or Node-RED). One
-  language would be attractive, but Node's ecosystem for AEC formats and tabular data is much
-  weaker, and it goes against the stated Python preference.
+- **TypeScript/Node end-to-end.** Node's ecosystem for AEC formats and tabular data is much
+  weaker than Python's, and it goes against the stated Python preference.
 - **C#/.NET.** This is the native language of the Revit, Navisworks and Tekla APIs, and it has
   strong desktop UI. It isn't worth it for the core, but a future **Revit adapter** should be a
   separate .NET process that talks to the engine through the same node/API contract.
 
-### 3.2 Frontend: **TypeScript + React + React Flow (xyflow)** (recommended)
+### 3.2 GUI: **NiceGUI (Python)** behind the HTTP API (recommended)
 
-| For | Against |
-|---|---|
-| React Flow is *only a canvas library* (MIT). We own the graph model, so it maps 1:1 to the graph document | We have to build the node palette, inspector and run controls ourselves, though these are generated from the registry |
-| Very large ecosystem: data grids (AG Grid Community / TanStack Table / Glide), JSON Schema forms (RJSF / JSON Forms) | A second language and toolchain (npm) in the repo |
-| TypeScript types are generated from the backend OpenAPI (`openapi-typescript`), so the cross-language contract is type-checked | Front-end skills are needed on the team |
+Without visual programming (D9), the GUI is a fairly conventional operations-and-review app:
+- **Projects:** the discovered list, with scan status per project and actions to start a scan.
+- **Runs:** start a pipeline, follow its progress, read its logs.
+- **Results grid:** filter, sort and page through 10⁶+ rows. Paging happens on the server
+  (DuckDB), never in the browser.
+- **Provenance:** a drawer showing where each value came from.
+- **Rejects review:** the files whose names didn't parse.
+- **Template tester:** type a folder name and see which template matched and what it extracted,
+  then edit and save the template YAML.
 
-### 3.3 Visual programming library: critical comparison
+None of that needs a custom canvas, which was the main reason for a TypeScript front end.
 
 | Option | Verdict | Reasoning |
 |---|---|---|
-| **Total.js Flow** | ✗ Not recommended | Flow is a complete *Node.js application with its own runtime*: components run inside Flow. Using it with a Python engine means **two execution engines**, with Python calls from each component over HTTP or a subprocess. You would fight its model instead of using it. The community is smaller and the English docs are thin. |
-| **Node-RED** | ✗ | Same problem: message-per-event execution in Node.js. It fits IoT, not batch tabular ETL. |
-| **React Flow (xyflow)** | ✓ **Recommended** | A pure UI canvas with no execution model to fight. It is mature and widely used. |
-| **Rete.js v2** | ~ Viable alternative | Also framework-agnostic and TypeScript. Its optional JS dataflow engine isn't needed. The community is smaller than React Flow's. |
-| **LiteGraph.js (ComfyUI lineage)** | ~ Viable | ComfyUI proves the exact pattern (Python node classes → `/object_info` → generated browser UI). Canvas rendering performs well, but the code base is older and less idiomatic to extend. |
-| **Qt desktop (PySide6 + NodeGraphQt / Ryven)** | ✗ for now | Everything stays in Python, but the GUI becomes tied to the engine process. Qt node editors and data grids take a lot of work to make good, and remote/server use isn't possible. |
+| **NiceGUI** | ✓ **Recommended** | *Python only*, so there's one language and one toolchain. It is built on FastAPI with Vue/Quasar components. It includes AG Grid, server-paged tables, forms, a code editor and live-updating elements. `native=True` runs it in a pywebview window, which gives the desktop app (§6, mode B) almost for free, and the same app also runs in a browser. |
+| TypeScript + React SPA | ~ Upgrade path | It offers the most control and the largest ecosystem, but adds a second language, npm and front-end skills. Only worth it if NiceGUI's limits are hit. Because the GUI talks only to the HTTP API, it can be swapped later without touching the engine. |
+| Qt (PySide6) | ~ Viable | A real desktop app, and its model/view tables handle millions of rows very well. On the other hand, development is slower, it can't be used from a browser, PyInstaller bundles are large, and it is harder to restyle. |
+| Streamlit | ✗ | Its "re-run the whole script on every interaction" model fights a stateful app with long-running scans and server-side paging. |
+| Dash / Panel | ✗ | They are oriented to dashboards and charts. They could do the job but are no better than NiceGUI for it. |
 
-**Critical caveat on visual programming itself.** Node graphs are good for *coarse topology*:
-"scan → parse naming → map codes → group revisions → export". They are poor for *fine logic*
-such as regexes, code-list mappings and precedence rules. Keep nodes **coarse-grained** and
-configure the logic inside each node with purpose-built editors: a naming-convention builder
-with live test strings, mapping tables and rule lists. Also expect that many users never touch
-the graph and only pick a **preset pipeline** and adjust the naming convention. For that
-reason the **results grid and rule tester should ship before the graph editor** (see roadmap).
+**Keeping GUI and engine separate in an all-Python stack.** Using one language makes it tempting
+for the GUI to import the engine directly. Prevent that:
+- The GUI lives in `filetra.gui` and may import only **`filetra.client`**, a typed API client, plus
+  the shared pydantic schemas. An **import-linter** contract in CI enforces this.
+- `filetra.client` uses `httpx`. In the desktop app it runs **in-process** (`httpx.ASGITransport`
+  pointed at the engine's FastAPI app), so no socket is needed. Against a remote engine (§6 mode A)
+  it uses normal HTTP. The GUI code is the same in both cases.
+
+**Critique:**
+- *NiceGUI is a smaller project than React.* The UI is server-driven: each interaction is a
+  WebSocket round-trip to Python. That's ideal for a local single-user app and fine on a LAN, but
+  highly custom widgets are harder to build. The API boundary is the hedge, because the GUI can be
+  replaced without touching the engine.
+- *The GUI process does real work* (rendering and paging state), so long-running engine work must
+  never run on its event loop. Runs go to the engine's executor, and the GUI only subscribes to
+  progress events.
 
 ---
 
@@ -158,15 +171,15 @@ filetra/
 │  │  ├─ model.py              # domain entities (Location, FileObject, Document, Revision, …)
 │  │  ├─ tables.py             # named table schemas used as port types
 │  │  ├─ protocols.py          # Source / Transform / Sink protocols, NodeContext
-│  │  ├─ registry.py           # @node decorator, entry-point discovery, catalog export
-│  │  ├─ graph.py              # graph document model (pydantic) + validation
+│  │  ├─ registry.py           # @node decorator, entry-point discovery, node reference export
+│  │  ├─ pipeline.py           # pipeline document model (pydantic) + validation
 │  │  ├─ executor.py           # topological run, per-node caching, cancellation, events
 │  │  ├─ provenance.py         # Assertion model, precedence/reconciliation
 │  │  └─ templates.py          # pattern-template engine: regex compile, match, format (§5.3)
 │  ├─ config.py               # strict YAML loading → pydantic models, schema export (§4.8)
 │  ├─ store/
 │  │  ├─ base.py               # repository interfaces (control store, dataset store)
-│  │  ├─ control_sqlite.py     # roots, projects, runs, graphs, cache index, scan checkpoints
+│  │  ├─ control_sqlite.py     # roots, projects, runs, cache index, scan checkpoints
 │  │  ├─ datasets.py           # partitioned Parquet datasets (per project), DuckDB views
 │  │  └─ migrations/
 │  ├─ nodes/                   # built-in nodes, registered exactly like third-party ones
@@ -185,9 +198,11 @@ filetra/
 │  ├─ conventions/             # NamingConvention modules (iso19650.py, …), revision schemes, code lists
 │  │                           #   later: data-driven conventions (YAML templates) as another implementation
 │  ├─ templates/               # example config: projects.example.yaml, pipeline.example.yaml
-│  ├─ api/                     # FastAPI app: catalog, graphs, runs, results, events
+│  ├─ api/                     # FastAPI app: projects, pipelines, runs, results, templates, events
+│  ├─ client.py                # typed httpx client (HTTP or in-process ASGI transport)
+│  ├─ gui/                     # NiceGUI app; may import only filetra.client + schemas (import-linter)
+│  ├─ pipelines/               # shipped preset pipelines (YAML)
 │  └─ cli.py                   # Typer: scan, run, nodes, serve, validate
-├─ web/                        # TypeScript SPA (separate package.json, built to static files)
 ├─ tests/
 │  ├─ fixtures/trees/          # synthetic directory trees as text files
 │  └─ …
@@ -249,10 +264,9 @@ class NamingConventionParser:
 ```
 
 **Port types** are *named table schemas* (`FileObjects`, `ParsedFields`, `Documents`,
-`Revisions`, `Assertions`, …). Each one is a set of column names, dtypes and required flags. An
-edge is valid when the output schema satisfies the input schema (structural, so extra columns are
-allowed). Both the GUI (while drawing an edge) and the engine (`filetra validate pipeline.yaml`)
-check this.
+`Revisions`, `Assertions`, …). Each one is a set of column names, dtypes and required flags. A
+connection is valid when the output schema satisfies the input schema (structural, so extra
+columns are allowed). `filetra validate pipeline.yaml` checks this before anything runs.
 
 **Simple functions:** a `@transform` shorthand wraps a plain function
 `def f(df: pl.DataFrame, cfg: Cfg) -> pl.DataFrame`, so most plugins stay a few lines long.
@@ -267,43 +281,61 @@ A firm-specific package (`filetra-acme`) adds nodes and conventions without fork
 - *Schema checking at edges can be overly strict or loose.* Start structural and minimal (required
   columns plus dtypes). Don't adopt a heavyweight schema library (pandera) until it's needed.
 - *Versioning:* every node type carries `version`. Each config model includes a migration hook,
-  so saved graphs keep loading after nodes evolve. This is cheap now and costly to retrofit.
+  so saved pipelines keep loading after nodes evolve. This is cheap now and costly to retrofit.
 
-### 4.3 Graph document (the GUI ↔ engine contract)
+### 4.3 Pipeline document (D8, D9)
+
+A pipeline is a YAML file that is meant to be written and read by people. Each node names its
+inputs as `<node>.<output>`, so there is no separate edge list, and the DAG can be read top to
+bottom.
 
 ```yaml
-# yaml-language-server: $schema=../schemas/filetra.graph-1.json
-format: filetra.graph/1
-name: Riverside – disk register
+# yaml-language-server: $schema=../schemas/filetra.pipeline-1.json
+format: filetra.pipeline/1
+name: Disk register – all projects
 
 nodes:
+  - id: projects
+    type: filetra.source.project_discovery@1
+    config: { templates: templates.yaml }
+
   - id: scan
     type: filetra.source.fs_scan@1
+    inputs: { projects: projects.projects }
     config:
-      roots: ['\\fs01\Projects\P1234']
       exclude: ['**/~$*', '**/Thumbs.db']
+
   - id: name
     type: filetra.parse.naming_convention@1
+    inputs: { files: scan.files }
     config: { convention: iso19650 }
+
   - id: group
     type: filetra.transform.group_documents@1
+    inputs: { parsed: name.parsed }
     config: { revision_scheme: iso19650 }
-  - id: out
+
+  - id: register
     type: filetra.sink.csv@1
+    inputs: { rows: group.latest }
     config: { path: out/register.csv }
 
-edges:
-  - { from: scan.files,   to: name.files }
-  - { from: name.parsed,  to: group.parsed }
-  - { from: group.latest, to: out.rows }
-
-ui:                       # GUI layout only, ignored by the engine
-  positions: { scan: [0, 0], name: [240, 0] }
+  - id: rejects
+    type: filetra.sink.csv@1
+    inputs: { rows: name.rejects }
+    config: { path: out/rejects.csv }
 ```
 
-`ui` is opaque to the engine. Keeping layout separate from semantics keeps diffs clean. Over
-HTTP, the same document travels as JSON, because the API is not a configuration file. The engine
-reads and writes YAML only on disk.
+**Presets:** filetra ships ready-made pipelines (`filetra pipelines list`, `filetra pipelines
+copy disk-register`). Most use starts from a preset and only changes the templates or config
+values. The GUI lists the pipelines and runs them, but doesn't edit their structure. Over HTTP the
+document travels as JSON, because the API is not a configuration file.
+
+**Critique:** without a canvas, any change to a pipeline's *structure* means editing YAML. Three
+things make that acceptable: pipelines are short, the schema-aware editor autocompletes node types
+and config keys, and `filetra validate` reports errors with line numbers. If structural edits
+become common for non-technical users, a simple *form-based* step list in the GUI is a far smaller
+project than a node editor.
 
 ### 4.4 Executor
 
@@ -319,10 +351,10 @@ reads and writes YAML only on disk.
   Most of the work is partition-local. That is what makes 10⁸+ files feasible on one machine.
 - **Per-node caching:** the cache key is a hash of the node type and version, its config, and the
   cache keys of its inputs. Re-running after a regex change only recomputes downstream nodes, which
-  makes a live "preview this node" in the GUI practical.
+  makes quick iteration with `--until <node>` practical.
 - Cancellation, progress events (published to the API → WebSocket) and structured run logs.
 - **Build vs adopt:** Dagster, Prefect and Airflow are server-heavy and designed for engineers
-  writing Python DAGs, not for user-edited graphs. Hamilton is close in spirit, but it builds graphs
+  writing Python DAGs, not for pipelines defined as configuration. Hamilton is close in spirit, but it builds graphs
   from function signatures, not from a document. A purpose-built executor is about 300 lines. The
   risk is slowly re-implementing an orchestrator, so keep scheduling outside (cron or Task
   Scheduler calling the CLI) and refuse scope creep.
@@ -361,7 +393,7 @@ therefore split into two planes:
 
 | Plane | Technology | Holds |
 |---|---|---|
-| **Control** | **SQLite (WAL)**, small | Roots and discovered projects, scan checkpoints and status per project, runs, graphs, the node-cache index, code lists |
+| **Control** | **SQLite (WAL)**, small | Roots and discovered projects, scan checkpoints and status per project, runs, pipeline run history, the node-cache index, code lists |
 | **Data** | **Parquet datasets partitioned by project** (`data/<dataset>/project=<id>/part-*.parquet`), queried with **DuckDB/Polars lazily** | File listings, parsed fields, assertions, documents/revisions, aggregates |
 
 **Change history without a full copy per scan.** Each project partition holds the *current state*
@@ -401,7 +433,7 @@ snapshot per scan is never stored.
 | `parquet` | Columnar | For large volumes or for Power BI, pandas, DuckDB and similar tools. |
 | `excel` | xlsx | Only for filtered views. **Hard limit of 1,048,576 rows**, so the sink fails clearly instead of truncating. |
 
-Every export also writes a small `manifest.json` next to the data. It records the graph, the node
+Every export also writes a small `manifest.json` next to the data. It records the pipeline, the node
 versions, the run id, the time, the row counts and the source projects, so any CSV can be traced
 back to how it was produced.
 
@@ -662,42 +694,38 @@ overrides:
 
 ## 6. GUI ↔ backend separation and packaging
 
-The separation itself is simple: **HTTP + JSON with an OpenAPI contract, plus a WebSocket for run
-events.** The SPA builds to static files, and the backend can serve them. This one decision keeps
-every deployment option below open, with **no code changes** between them.
+The separation is **HTTP + JSON with an OpenAPI contract, plus a WebSocket for run events.** The
+GUI reaches the engine only through `filetra.client` (§3.2). That keeps every deployment option
+below open, with **no code changes** between them.
 
 | Mode | How | For | Against |
 |---|---|---|---|
-| **A. Server / service** ✓ *for large scale* | The backend runs as a Windows service or container *near the file server*; users open a browser | No desktop packaging. Scans run next to the data (fast). One install. Shared results. | Needs auth. **The service account can see every file, so results could expose folders a user can't open.** Map users to permissions or limit roots per user. Linux containers must mount SMB (credentials, Kerberos). |
-| **B. Desktop via pywebview** ✓ *first* | One Python process runs FastAPI on `127.0.0.1:<random>` with a per-launch token, inside a native webview (WebView2 on Windows); frozen with PyInstaller | Single toolchain (Python only at runtime), small, and the user's own share permissions apply | Fewer shell features (auto-update, tray). **PyInstaller binaries are often flagged by corporate antivirus**, so budget for code signing. |
-| **C. Desktop via Tauri + Python sidecar** | A Rust shell bundles the SPA and launches the frozen backend as a sidecar | Polished installer, auto-update, small footprint | Three toolchains (Rust, Node, Python) plus sidecar lifecycle management. Worth it only once B hits its limits. |
-| **D. Electron + sidecar** | As C, with Chromium bundled | Most mature | Large (150 MB+) and still needs the Python sidecar. No advantage over C here. |
+| **A. Engine near the data** ✓ *for large scale* | `filetra serve` runs the engine API as a Windows service on a machine next to the file server. The GUI connects to it, either locally or by being served from that machine. | Scans run next to the data (fast). | Needs auth if more than one person can reach it. **The service account can see every file, so results could expose folders a user can't open.** |
+| **B. Desktop app** ✓ *first* | One Python process: the engine's FastAPI app plus the NiceGUI app, shown in a native window (`native=True` uses pywebview, which uses WebView2 on Windows). Frozen with PyInstaller. | One language and one toolchain. The user's own share permissions apply. | **PyInstaller binaries are often flagged by corporate antivirus**, so budget for code signing. No built-in auto-update. |
+| C. Browser, no packaging | `uv run filetra gui` opens the same app in the default browser | No packaging at all. Ideal during development and early use. | Needs Python and uv installed. |
 
-**Recommendation (updated for D1):** ship **B (pywebview desktop) first**, because the tool is for a
-single user and runs with that user's own share permissions. Keep A working as a byproduct, since
-it is the same artifact: a headless `filetra serve` on a machine near the file servers, for the
-scale case in §5.2. Treat C as an upgrade path. Before any multi-user rollout, A needs auth and
-permission scoping.
-
-During development and for early use, you don't need any packaging. Run `uv run filetra serve`
-and open the browser. Whichever mode is used, the local API must bind to loopback only and require
-a token, because otherwise any web page could call a localhost file-system API.
+**Recommendation:** use C during development and early use. Ship **B** when packaging is worth it,
+and keep **A** for the scale case in §5.2. Whichever mode is used, any port the API listens on
+binds to loopback only and requires a per-launch token, because otherwise any web page could call
+a localhost file-system API. In mode B with the in-process transport, no port is opened for the
+engine at all.
 
 ---
 
 ## 7. API surface (initial)
 
 ```
-GET  /api/catalog                 node types, ports, config JSON Schemas, UI hints
-GET  /api/conventions             naming conventions, revision schemes, code lists
-POST /api/conventions/test        {convention, samples[]} → parsed fields + reasons (live tester)
-CRUD /api/graphs                  graph documents
-POST /api/graphs/{id}/validate    type and schema checks → errors per node and edge
-POST /api/runs                    {graph, target_node?} → run id   (target_node = preview)
+GET  /api/projects                discovered projects, scan status per project
+POST /api/scans                   {project_ids? | all} → run id
+GET  /api/pipelines               available pipelines (files + presets)
+POST /api/pipelines/{id}/validate type and schema checks → errors with file/line
+POST /api/runs                    {pipeline, until_node?} → run id
 GET  /api/runs/{id}               status, per-node stats
 WS   /api/runs/{id}/events        progress, logs, node completion
-GET  /api/results/{table}         paginated, filterable, sortable rows (grid)
+GET  /api/results/{table}         server-paged, filterable, sortable rows (grid)
 GET  /api/entities/{id}/provenance  assertions behind each value
+POST /api/templates/try           {templates, path} → match, fields, why others didn't match
+GET  /api/nodes                   node types, inputs/outputs, config schemas (reference)
 ```
 
 ---
@@ -706,13 +734,12 @@ GET  /api/entities/{id}/provenance  assertions behind each value
 
 | Phase | Deliverable | Why this order |
 |---|---|---|
-| **0. Core + CLI** | model, protocols, registry, graph and partitioned executor, SQLite control store plus Parquet datasets; pattern-template engine + `filetra templates test/try/report`; nodes `project_discovery` (JSON templates), `fs_scan` (read-only, resumable, concurrency-limited), `listing_file`, `path_segments`, `naming_convention` with a **fixed module** (ISO 19650; more modules later), `revision`, `group_documents`; **CSV / JSONL / JSON** sinks with manifest; `filetra run pipeline.yaml`; a synthetic generator that builds 10⁶–10⁸-row listings for load tests | Tests the hardest assumption, *can we infer reliable metadata from real paths?*, with real data before any GUI investment. It also proves the D3 scale path early. |
-| **1. API** | FastAPI over the engine: catalog, runs, results, convention tester, events | Makes the contract concrete. OpenAPI then generates the TS types. |
-| **2. Web UI: results first** | results grid with filters, a provenance drawer, a rejects review, a naming-convention builder and tester | Highest user value, and needs no graph editor |
-| **3. Web UI: graph editor** | React Flow canvas driven by `/catalog`, schema-generated config forms, per-node preview | Built once nodes and contracts have stabilised |
-| **4. Configurable conventions and enrichment** | `DeclarativeConvention` (YAML) + GUI convention builder (D2); Excel drawing registers, PDF title-block extraction, IFC/DWG properties, tag rules, reconciliation, dashboards | Each is just a new node or convention implementation |
-| **5. Packaging** | pywebview desktop build (D1), signed; `filetra serve` documented for running near the data | Packaging comes last, when there is something worth packaging |
-| **6. (If needed) multi-user** | auth, permission scoping, Postgres control plane, CDE API sources | Only if D1 changes |
+| **0. Core + CLI** | model, protocols, registry, pipeline loader and partitioned executor, SQLite control store plus Parquet datasets; pattern-template engine + `filetra templates test/try/report`; nodes `project_discovery` (YAML templates), `fs_scan` (read-only, resumable, concurrency-limited), `listing_file`, `path_segments`, `naming_convention` with a **fixed module** (ISO 19650; more modules later), `revision`, `group_documents`; **CSV / JSONL / JSON** sinks with manifest; `filetra run pipeline.yaml`; a synthetic generator that builds 10⁶–10⁸-row listings for load tests | Tests the hardest assumption, *can we infer reliable metadata from real paths?*, with real data before any GUI investment. It also proves the D3 scale path early. |
+| **1. API + client** | FastAPI over the engine (projects, pipelines, runs, results, template tester, events) plus the typed `filetra.client` | Makes the GUI ↔ engine contract concrete before the GUI is built against it |
+| **2. GUI (NiceGUI)** | projects and scan status, pipeline runs with progress, results grid, provenance drawer, rejects review, template tester and editor | Highest user value. Runs in a browser via `uv run filetra gui`. |
+| **3. Configurable conventions and enrichment** | `DeclarativeConvention` (YAML) + GUI convention builder (D2); Excel drawing registers, PDF title-block extraction, IFC/DWG properties, tag rules, reconciliation, dashboards | Each is just a new node or convention implementation |
+| **4. Packaging** | pywebview desktop build (D1), signed; `filetra serve` documented for running near the data | Packaging comes last, when there is something worth packaging |
+| **5. (If needed) multi-user** | auth, permission scoping, Postgres control plane, CDE API sources | Only if D1 changes |
 
 ---
 
@@ -720,12 +747,13 @@ GET  /api/entities/{id}/provenance  assertions behind each value
 
 | Risk | Mitigation |
 |---|---|
-| Building a visual programming environment absorbs the project | Results-first UI, coarse nodes and preset pipelines. The graph editor is phase 3. |
+| NiceGUI limits for a richer GUI later | The GUI only talks to `filetra.client` and the HTTP API, so it can be replaced (e.g. with a TypeScript SPA) without touching the engine. |
+| Editing pipeline YAML is too technical for some users | Presets, a schema-aware editor, `filetra validate` with line numbers; a form-based step list in the GUI if needed (no canvas). |
 | Real-world filenames are messier than any convention | Partial parsing, confidence scores, a rejects workflow and a fuzzy fallback. Measure the parse rate on real projects in phase 0. |
 | Network scan performance and permissions | Parallel walk, a concurrency limit per file server, resumable checkpoints per project, incremental rescans, and running near the data at large scale (§5.2). |
 | Scale is out by orders of magnitude (D3) | Partitioned Parquet with lazy queries from day one, plus a synthetic 10⁸-row load test in phase 0, so the limits are measured instead of assumed. |
 | Data exposure through a privileged service account | Not an issue for a single desktop user (D1). Needs per-user root scoping before any multi-user rollout. |
-| Saved graphs break as nodes evolve | Node versioning and config migrations from day one. |
+| Saved pipelines break as nodes evolve | Node versioning and config migrations from day one. |
 | Packaging friction in corporate IT (AV, signing, admin rights) | Use `uv run filetra serve` plus a browser until phase 5. Then sign desktop builds and install per user with no admin rights. |
 
 **Open questions** (they don't block phase 0):
