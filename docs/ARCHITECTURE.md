@@ -12,16 +12,18 @@ also reviews each choice critically.
 |---|---|---|---|
 | D1 | Users | **Single user for now.** Multi-user may come later. | The first deployment is a **local desktop app** (§6, mode B). It runs with the user's own share permissions, so there is no auth or data-exposure problem yet. Keep the `store` interface so Postgres/server mode remains possible. |
 | D2 | Naming conventions | **Fixed naming modules first.** Configurable company/project/client conventions come later. | Naming parsers sit behind a `NamingConvention` protocol (§5.1). Phase 0 ships hand-written modules (ISO 19650 and others). A data-driven, GUI-editable convention is added later as just another implementation of the same protocol. |
-| D3 | Scale | **About 1,000 shares × about 1,000 files = 10⁶ files at the start**, possibly 10⁸–10⁹ later. | Storage moves to **partitioned Parquet with DuckDB/Polars** for the data and SQLite for control state (§4.6). Execution is **partitioned per share** (§4.4). The share inventory is a first-class part of the design (§5.2). Excel can't be a primary output because of its 1,048,576-row limit. |
+| D3 | Scale | **Thousands of projects × about 1,000 files ≈ 10⁶ files at the start**, possibly 10⁸–10⁹ later. They sit on **only one or two shares**, so a project is a folder (or folders) on a share, not a share. | Storage moves to **partitioned Parquet with DuckDB/Polars** for the data and SQLite for control state (§4.6). Execution is **partitioned per project** (§4.4). **Project discovery** is a first-class part of the design (§5.2). Because everything is on one or two file servers, how hard the scanner hits each server matters more than the total parallelism. Excel can't be a primary output because of its 1,048,576-row limit. |
 | D4 | Write-back | **Read-only.** | This is enforced by design. Sources only get a read-only file-system interface, and nothing in the engine opens files on a share for writing (§5). |
+| D6 | Hashing | **No content hashing for now.** Only the metadata that is cheap to collect. | The scan collects only what a directory listing and stat give: name, path, is_dir, size, mtime, ctime, extension and Windows attributes. No file content is read, so the scan never touches access times. Move detection uses size, mtime and name only (§5). Hashing stays a possible later add-on node. |
 | D5 | Outputs | **Easy human/machine-readable formats** (CSV, JSON). | The primary sinks are **CSV, JSON Lines and JSON**. Parquet is the internal format and an optional export. Excel is a convenience sink for small filtered views only (§4.7). |
 
 ---
 
 ## 1. Problem restated
 
-- **Volume:** about 1,000 shares of about 1,000 files each to start (10⁶ files). The design must
-  also handle 10⁸–10⁹ files (D3). The shares are deep, messy, and often reached over SMB/VPN.
+- **Volume:** thousands of projects of about 1,000 files each to start (10⁶ files), on one or two
+  network shares. The design must also handle 10⁸–10⁹ files (D3). The folder trees are deep, messy,
+  and often reached over SMB/VPN.
 - **Implicit metadata:** the meaning sits in *paths and filenames*. Examples:
   `\\fs01\Projects\P1234 Riverside\05 Shared\Architecture\P1234-ARP-ZZ-01-DR-A-1001_C02.pdf`
   carries the project, the CDE state, the discipline, ISO 19650 fields and a revision.
@@ -160,11 +162,11 @@ filetra/
 │  │  └─ provenance.py         # Assertion model, precedence/reconciliation
 │  ├─ store/
 │  │  ├─ base.py               # repository interfaces (control store, dataset store)
-│  │  ├─ control_sqlite.py     # shares, runs, graphs, cache index, scan checkpoints
-│  │  ├─ datasets.py           # partitioned Parquet datasets (per share), DuckDB views
+│  │  ├─ control_sqlite.py     # roots, projects, runs, graphs, cache index, scan checkpoints
+│  │  ├─ datasets.py           # partitioned Parquet datasets (per project), DuckDB views
 │  │  └─ migrations/
 │  ├─ nodes/                   # built-in nodes, registered exactly like third-party ones
-│  │  ├─ sources/share_inventory.py # the list of shares (CSV) → Locations
+│  │  ├─ sources/project_discovery.py # roots + rules (+ optional CSV) → Projects
 │  │  ├─ sources/fs_scan.py
 │  │  ├─ sources/listing_file.py   # import a saved listing (dir /s, CSV) for offline work
 │  │  ├─ parse/path_segments.py
@@ -289,11 +291,11 @@ A firm-specific package (`filetra-acme`) adds nodes and conventions without fork
 ### 4.4 Executor
 
 - Topological execution of a DAG, with cycle detection during validation.
-- **Partitioned execution (D3).** Data is partitioned **by share**. Each node declares whether it is
+- **Partitioned execution (D3).** Data is partitioned **by project**. Each node declares whether it is
   `partition_local` or `global`:
-  - `partition_local` nodes, such as scan, path parsing and naming parsing, run per share. They
-    run in parallel, use bounded memory, and only re-run for shares whose input changed.
-  - `global` nodes, such as grouping documents across shares, cross-share duplicates and
+  - `partition_local` nodes, such as scan, path parsing and naming parsing, run per project. They
+    run in parallel, use bounded memory, and only re-run for projects whose input changed.
+  - `global` nodes, such as grouping documents across projects, cross-project duplicates and
     aggregates, run over the whole dataset. They use lazy Polars/DuckDB queries over Parquet, so
     they don't need everything in RAM.
 
@@ -314,7 +316,8 @@ A firm-specific package (`filetra-acme`) adds nodes and conventions without fork
 |---|---|---|
 | **Location** | root id + UNC root | Paths are stored as *(root_id, relative_path)*, so a remapped drive or share move is a single update. Mapped drive letters are normalised to UNC. |
 | **Snapshot** | scan run id | Each scan is a snapshot. Diffs between snapshots give added, removed, modified and moved files. |
-| **FileObject** | (root, rel_path) per snapshot | size, mtime, ctime, is_dir, extension, optional hash (lazy) |
+| **Project** | project id (e.g. the number parsed from its folder name) | one or more folders on a root. It is the unit of partitioning, scanning and convention assignment. |
+| **FileObject** | (root, rel_path) per snapshot | size, mtime, ctime, is_dir, extension, Windows attributes (no hash, D6) |
 | **Document** | normalised document number | the logical item. Its identity is *never* the path. |
 | **Revision** | (document, revision code) | ordered by a pluggable **revision scheme** |
 | **Rendition** | (revision, format) | the same revision as pdf, dwg, … |
@@ -341,10 +344,10 @@ therefore split into two planes:
 
 | Plane | Technology | Holds |
 |---|---|---|
-| **Control** | **SQLite (WAL)**, small | The share inventory, scan checkpoints and status per share, runs, graphs, the node-cache index, code lists |
-| **Data** | **Parquet datasets partitioned by share** (`data/<dataset>/share=<id>/part-*.parquet`), queried with **DuckDB/Polars lazily** | File listings, parsed fields, assertions, documents/revisions, aggregates |
+| **Control** | **SQLite (WAL)**, small | Roots and discovered projects, scan checkpoints and status per project, runs, graphs, the node-cache index, code lists |
+| **Data** | **Parquet datasets partitioned by project** (`data/<dataset>/project=<id>/part-*.parquet`), queried with **DuckDB/Polars lazily** | File listings, parsed fields, assertions, documents/revisions, aggregates |
 
-**Change history without a full copy per scan.** Each share partition holds the *current state*
+**Change history without a full copy per scan.** Each project partition holds the *current state*
 plus an **append-only change log**: added, removed, modified and moved files, each with a scan
 id. History can be rebuilt by replaying the log (a slowly-changing-dimension pattern). A full
 snapshot per scan is never stored.
@@ -352,8 +355,10 @@ snapshot per scan is never stored.
 **Why this fits:**
 - Paths compress extremely well in Parquet thanks to dictionary encoding and zstd. Directory
   prefixes repeat heavily, so 10⁹ rows are realistic on a workstation disk.
-- Partitioning per share matches both the scan unit and the unit of incremental recompute. A
-  changed share only rewrites its own partition.
+- Partitioning per project matches both the scan unit and the unit of incremental recompute. A
+  changed project only rewrites its own partition. Thousands of projects of about 1,000 files each
+  produce many small partitions, which is fine for DuckDB. A periodic compaction step can merge
+  small files if the file count becomes a problem.
 - DuckDB queries across all partitions with SQL, and it is also the engine behind result-grid
   paging and filtering.
 
@@ -373,14 +378,14 @@ snapshot per scan is never stored.
 
 | Sink | Format | Notes |
 |---|---|---|
-| `csv` ✓ | UTF-8 with BOM (so Excel opens it correctly), RFC 4180 quoting | Human-friendly. One file per table, optionally one per share. |
+| `csv` ✓ | UTF-8 with BOM (so Excel opens it correctly), RFC 4180 quoting | Human-friendly. One file per table, optionally one per project. |
 | `jsonl` ✓ | JSON Lines | Machine-friendly and streamable at any size. The preferred machine export. |
 | `json` | A single document (nested: document → revisions → renditions) | Convenient for small, filtered results only. Refuses to run above a configurable row limit. |
 | `parquet` | Columnar | For large volumes or for Power BI, pandas, DuckDB and similar tools. |
 | `excel` | xlsx | Only for filtered views. **Hard limit of 1,048,576 rows**, so the sink fails clearly instead of truncating. |
 
 Every export also writes a small `manifest.json` next to the data. It records the graph, the node
-versions, the run id, the time, the row counts and the source shares, so any CSV can be traced
+versions, the run id, the time, the row counts and the source projects, so any CSV can be traced
 back to how it was produced.
 
 ---
@@ -392,7 +397,7 @@ The hard parts here are operational, not algorithmic.
 **Read-only by construction (D4).** Sources receive a narrow `ReadOnlyFS` interface (`scandir`,
 `stat`, `open_read`), never `pathlib.Path` or `os` directly. Nothing in the engine opens files on
 a share for writing. Note that a scan never changes access times either, because we only list
-and stat files and never read their content unless hashing is turned on. A test asserts that no
+and stat files and never read their content (D6: no hashing). A test asserts that no
 built-in node imports write-capable file-system APIs for share paths.
 
 - **Scale and latency:** walk directories in parallel with a thread pool (`os.scandir`), producing
@@ -402,7 +407,8 @@ built-in node imports write-capable file-system APIs for share paths.
   over SMB. So the baseline is a **full rescan diffed against the previous snapshot**. A
   directory-mtime fast path is an *optional heuristic*, and the user is told when it's in use.
 - **Move/rename detection:** match removed and added files by (size, mtime, name similarity).
-  Content hashing over SMB is expensive, so it's opt-in and only used to confirm.
+  There is no content hashing (D6), so ambiguous matches are reported as remove + add with a
+  "possible move" flag rather than guessed.
 - **Windows hazards:** paths over 260 characters (common in AEC folder hierarchies) need the `\\?\`
   prefix or LongPathsEnabled. Other hazards: `PermissionError` on ACL-restricted folders (record
   and continue, never abort), case-insensitive collisions, invalid or odd Unicode, offline files
@@ -439,11 +445,11 @@ The meaning comes from three places, and each one gets a dedicated node:
        def parse(self, name: str, path_fields: Mapping[str, str]) -> ParseResult: ...
    ```
 
-   - **Phase 0:** hand-written modules (`iso19650`, plus one or two real company/client
-     conventions as examples), registered through the same entry-point mechanism as nodes.
+   - **Phase 0:** a hand-written `iso19650` module, registered through the same entry-point
+     mechanism as nodes. Company/client modules come later, following the same pattern.
    - **Later:** a `DeclarativeConvention` that loads YAML (fields, delimiters, code lists,
      regexes), which the GUI convention builder edits. It's just another implementation.
-   - **Selecting a convention per share/project:** a rule table (`share or path pattern →
+   - **Selecting a convention per project:** a rule table (`project or path pattern →
      convention id`) lets different projects and clients use different conventions in one run.
      It can also try several conventions and keep the result with the highest confidence.
 3. **Revision** (`revision`): extracts the revision and status from a suffix, brackets or a
@@ -460,28 +466,46 @@ lists) that produces lower-confidence assertions. Don't attempt ML or LLM classi
 deterministic pipeline and the reject-review workflow exist. When it comes, it is just another
 node that emits low-confidence assertions.
 
-### 5.2 Share inventory and scan orchestration (D3)
+### 5.2 Project discovery and scan orchestration (D3)
 
-With about 1,000 shares, the *list of shares* is data in its own right:
+Thousands of projects live as folders on **one or two shares**. The *list of projects* is data
+in its own right, and it is **discovered from the folder structure**, not maintained by hand:
 
-- **Input:** `shares.csv` (`share_id, unc_root, project, client, convention, enabled, tags`).
-  Loading it with the `share_inventory` source creates or updates Locations in the control store.
-  This is also where the convention is assigned to each share (D2).
-- **Scheduling:** a scan queue with a **global concurrency limit** and a **limit per file
-  server**. Many shares usually live on a handful of servers, and hammering one filer with 64
-  parallel walks hurts the scan and other users. Both limits are configurable.
-- **Resilience:** each share has its own status (`ok / partial / denied / unreachable`), last
-  successful scan time, duration and counts. Failures are retried with backoff, and a share that
-  fails never blocks the others. A scan is **resumable**: a checkpoint per share records completed
-  top-level directories, so an interrupted 10⁸-file run doesn't start from zero.
+- **Roots:** a short config list of UNC roots, e.g. `\\fs01\Projects`. Each root carries a
+  **project rule** that says where project folders sit and how to read them. Examples:
+  - "every folder at depth 1 matching `^(?P<number>\d{4,6})[ _-]+(?P<name>.+)$` is a project";
+  - "depth 2 under `\<client>\<project>`", so the client comes from the parent folder.
+
+  Folders that don't match are reported as *unclassified* rather than silently skipped.
+- **`project_discovery` source:** lists only the top levels of each root, which is cheap, and
+  applies the rules. It creates or updates **Projects** in the control store with id, number,
+  name, client, folder(s), first seen and last seen. Projects that disappear are marked
+  *missing*, never deleted. An **optional override CSV** (`project_number, convention, enabled,
+  tags, extra_folders`) handles exceptions, such as a project split across two roots, disabling an
+  archive, or assigning a client's naming convention (D2).
+- **Scheduling:** the scan unit is **one project**. Everything sits on one or two file servers,
+  so the important control is a **concurrency limit per file server**, defaulting to something
+  modest like 8–16 parallel walkers and configurable. That is what keeps the scan from degrading
+  the filer for everyone else. Within a large project, top-level subfolders can be split into
+  separate work items so one huge project doesn't serialise the run.
+- **Resilience:** each project has its own status (`ok / partial / denied / missing`), last
+  successful scan time, duration and counts. Failures are retried with backoff, and a project that
+  fails never blocks the others. A scan is **resumable** because each project is checkpointed when
+  it completes, so an interrupted run continues from the next unscanned project.
+- **Incremental by project:** because projects are folders directly under a root, the root
+  listing alone shows *new* projects. The directory mtime of a project folder only reflects direct
+  children (see §5), so it can't prove a project is unchanged. The defaults are therefore:
+  1. a full rescan on a schedule (nightly or weekly), which is cheap at 10⁶ files;
+  2. on-demand rescans for selected projects ("refresh these 20 live projects");
+  3. a "hot projects first" ordering by recent activity, using the last scan's max(mtime).
 - **Throughput:** expect about 1–5k entries/s per walker thread over SMB on a LAN, and much less
-  over VPN. 10⁶ files then takes minutes to tens of minutes on a workstation. At 10⁸–10⁹, a full
+  over VPN. 10⁶ files then takes minutes to tens of minutes from a workstation. At 10⁸–10⁹, a full
   rescan takes hours to days, so at that scale:
-  1. incremental rescans (prioritise recently changed shares, and use the directory-mtime
-     heuristic) are essential;
-  2. running the scanner *near the data* (server mode, §6 mode A) becomes the correct deployment
-     even for a single user. The engine is the same and only its location changes. This is the
-     main reason to keep the GUI/engine split strict even though there is only one user today.
+  1. targeted and prioritised project rescans become the normal mode;
+  2. running the scanner *near the data* (`filetra serve` on a machine next to the file server,
+     §6 mode A) becomes the right deployment even for a single user. The engine is the same and
+     only its location changes. This is the main reason to keep the GUI/engine split strict even
+     though there is only one user today.
 
 ---
 
@@ -493,8 +517,8 @@ every deployment option below open, with **no code changes** between them.
 
 | Mode | How | For | Against |
 |---|---|---|---|
-| **A. Server / service** ✓ *first* | The backend runs as a Windows service or container *near the file server*; users open a browser | No desktop packaging. Scans run next to the data (fast). One install. Shared results. | Needs auth. **The service account can see every file, so results could expose folders a user can't open.** Map users to permissions or limit roots per user. Linux containers must mount SMB (credentials, Kerberos). |
-| **B. Desktop via pywebview** ✓ *second* | One Python process runs FastAPI on `127.0.0.1:<random>` with a per-launch token, inside a native webview (WebView2 on Windows); frozen with PyInstaller | Single toolchain (Python only at runtime), small, and the user's own share permissions apply | Fewer shell features (auto-update, tray). **PyInstaller binaries are often flagged by corporate antivirus**, so budget for code signing. |
+| **A. Server / service** ✓ *for large scale* | The backend runs as a Windows service or container *near the file server*; users open a browser | No desktop packaging. Scans run next to the data (fast). One install. Shared results. | Needs auth. **The service account can see every file, so results could expose folders a user can't open.** Map users to permissions or limit roots per user. Linux containers must mount SMB (credentials, Kerberos). |
+| **B. Desktop via pywebview** ✓ *first* | One Python process runs FastAPI on `127.0.0.1:<random>` with a per-launch token, inside a native webview (WebView2 on Windows); frozen with PyInstaller | Single toolchain (Python only at runtime), small, and the user's own share permissions apply | Fewer shell features (auto-update, tray). **PyInstaller binaries are often flagged by corporate antivirus**, so budget for code signing. |
 | **C. Desktop via Tauri + Python sidecar** | A Rust shell bundles the SPA and launches the frozen backend as a sidecar | Polished installer, auto-update, small footprint | Three toolchains (Rust, Node, Python) plus sidecar lifecycle management. Worth it only once B hits its limits. |
 | **D. Electron + sidecar** | As C, with Chromium bundled | Most mature | Large (150 MB+) and still needs the Python sidecar. No advantage over C here. |
 
@@ -531,7 +555,7 @@ GET  /api/entities/{id}/provenance  assertions behind each value
 
 | Phase | Deliverable | Why this order |
 |---|---|---|
-| **0. Core + CLI** | model, protocols, registry, graph and partitioned executor, SQLite control store plus Parquet datasets; nodes `share_inventory`, `fs_scan` (read-only, resumable, concurrency-limited), `listing_file`, `path_segments`, `naming_convention` with **fixed modules** (ISO 19650 + one real company convention), `revision`, `group_documents`; **CSV / JSONL / JSON** sinks with manifest; `filetra run graph.json`; a synthetic generator that builds 10⁶–10⁸-row listings for load tests | Tests the hardest assumption, *can we infer reliable metadata from real paths?*, with real data before any GUI investment. It also proves the D3 scale path early. |
+| **0. Core + CLI** | model, protocols, registry, graph and partitioned executor, SQLite control store plus Parquet datasets; nodes `project_discovery`, `fs_scan` (read-only, resumable, concurrency-limited), `listing_file`, `path_segments`, `naming_convention` with a **fixed module** (ISO 19650; more modules later), `revision`, `group_documents`; **CSV / JSONL / JSON** sinks with manifest; `filetra run graph.json`; a synthetic generator that builds 10⁶–10⁸-row listings for load tests | Tests the hardest assumption, *can we infer reliable metadata from real paths?*, with real data before any GUI investment. It also proves the D3 scale path early. |
 | **1. API** | FastAPI over the engine: catalog, runs, results, convention tester, events | Makes the contract concrete. OpenAPI then generates the TS types. |
 | **2. Web UI: results first** | results grid with filters, a provenance drawer, a rejects review, a naming-convention builder and tester | Highest user value, and needs no graph editor |
 | **3. Web UI: graph editor** | React Flow canvas driven by `/catalog`, schema-generated config forms, per-node preview | Built once nodes and contracts have stabilised |
@@ -546,18 +570,15 @@ GET  /api/entities/{id}/provenance  assertions behind each value
 | Risk | Mitigation |
 |---|---|
 | Building a visual programming environment absorbs the project | Results-first UI, coarse nodes and preset pipelines. The graph editor is phase 3. |
-| Real-world filenames are messier than any convention | Partial parsing, confidence scores, a rejects workflow and a fuzzy fallback. Measure the parse rate on real shares in phase 0. |
-| Network scan performance and permissions | Parallel walk, limits per server, resumable checkpoints per share, incremental rescans, and running near the data at large scale (§5.2). |
+| Real-world filenames are messier than any convention | Partial parsing, confidence scores, a rejects workflow and a fuzzy fallback. Measure the parse rate on real projects in phase 0. |
+| Network scan performance and permissions | Parallel walk, a concurrency limit per file server, resumable checkpoints per project, incremental rescans, and running near the data at large scale (§5.2). |
 | Scale is out by orders of magnitude (D3) | Partitioned Parquet with lazy queries from day one, plus a synthetic 10⁸-row load test in phase 0, so the limits are measured instead of assumed. |
 | Data exposure through a privileged service account | Not an issue for a single desktop user (D1). Needs per-user root scoping before any multi-user rollout. |
 | Saved graphs break as nodes evolve | Node versioning and config migrations from day one. |
-| Packaging friction in corporate IT (AV, signing, admin rights) | Server mode first. Sign desktop builds. Install per user with no admin rights. |
+| Packaging friction in corporate IT (AV, signing, admin rights) | Use `uv run filetra serve` plus a browser until phase 5. Then sign desktop builds and install per user with no admin rights. |
 
 **Open questions** (they don't block phase 0):
-1. Which one or two real company/client naming conventions should be the first fixed modules
-   besides ISO 19650? A sample of real filenames (anonymised if needed) would make the best test
-   fixtures.
-2. Where does the list of about 1,000 shares come from today: a spreadsheet, DFS namespace,
-   AD/LDAP, or a project database? This decides how `share_inventory` gets its input.
-3. Is content hashing (for duplicate and move detection) wanted, given its cost over SMB, or are
-   size, mtime and name enough?
+1. What do project folder names look like at the root, e.g. `12345 Project Name`, or
+   `Client\12345 - Name`? A handful of real examples (anonymised) would define the first
+   `project_discovery` rule.
+2. (Deferred) Which company/client naming conventions should follow ISO 19650 as fixed modules?
