@@ -15,7 +15,8 @@ also reviews each choice critically.
 | D3 | Scale | **Thousands of projects × about 1,000 files ≈ 10⁶ files at the start**, possibly 10⁸–10⁹ later. They sit on **only one or two shares**, so a project is a folder (or folders) on a share, not a share. | Storage moves to **partitioned Parquet with DuckDB/Polars** for the data and SQLite for control state (§4.6). Execution is **partitioned per project** (§4.4). **Project discovery** is a first-class part of the design (§5.2). Because everything is on one or two file servers, how hard the scanner hits each server matters more than the total parallelism. Excel can't be a primary output because of its 1,048,576-row limit. |
 | D4 | Write-back | **Read-only.** | This is enforced by design. Sources only get a read-only file-system interface, and nothing in the engine opens files on a share for writing (§5). |
 | D6 | Hashing | **No content hashing for now.** Only the metadata that is cheap to collect. | The scan collects only what a directory listing and stat give: name, path, is_dir, size, mtime, ctime, extension and Windows attributes. No file content is read, so the scan never touches access times. Move detection uses size, mtime and name only (§5). Hashing stays a possible later add-on node. |
-| D7 | Project folder names | **A customisable template system: regex with named groups, stored as JSON for now.** | A small, reusable **pattern-template engine** (§5.3) extracts key data such as the project number, name and client from project folder names. Templates are data, not code, and carry their own test examples. The same engine is designed for reuse later by `path_segments` and by data-driven naming conventions (D2). |
+| D7 | Project folder names | **A customisable template system: regex with named groups, stored as YAML (D8).** | A small, reusable **pattern-template engine** (§5.3) extracts key data such as the project number, name and client from project folder names. Templates are data, not code, and carry their own test examples. The same engine is designed for reuse later by `path_segments` and by data-driven naming conventions (D2). |
+| D8 | Configuration format | **All configuration files are YAML.** | Pipeline graphs (§4.3), pattern templates (§5.3), overrides and app settings are all `.yaml`. Loading is strict so that YAML's implicit typing can't corrupt values (§4.8). JSON stays only where it isn't configuration: HTTP API payloads, `json`/`jsonl` exports and the export `manifest.json`. JSON *Schema* is still generated from the pydantic models and validates the YAML files. |
 | D5 | Outputs | **Easy human/machine-readable formats** (CSV, JSON). | The primary sinks are **CSV, JSON Lines and JSON**. Parquet is the internal format and an optional export. Excel is a convenience sink for small filtered views only (§4.7). |
 
 ---
@@ -77,7 +78,7 @@ The principles below drive everything else:
 1. **The engine is a headless Python library.** The CLI and the HTTP API are thin shells over it.
    The GUI is one client among several. Every engine feature can be used and tested without a
    GUI.
-2. **The pipeline graph is a document (JSON), and that document is the contract.** The GUI edits
+2. **The pipeline graph is a document (YAML on disk), and that document is the contract.** The GUI edits
    the graph document and the engine executes it. Neither side needs the other's code. Graphs can
    be versioned in git, diffed and run headless on a schedule.
 3. **Nodes describe themselves.** Each node type publishes its ports, its port types and a
@@ -120,7 +121,7 @@ The principles below drive everything else:
 
 | For | Against |
 |---|---|
-| React Flow is *only a canvas library* (MIT). We own the graph model, so it maps 1:1 to the graph JSON | We have to build the node palette, inspector and run controls ourselves, though these are generated from the registry |
+| React Flow is *only a canvas library* (MIT). We own the graph model, so it maps 1:1 to the graph document | We have to build the node palette, inspector and run controls ourselves, though these are generated from the registry |
 | Very large ecosystem: data grids (AG Grid Community / TanStack Table / Glide), JSON Schema forms (RJSF / JSON Forms) | A second language and toolchain (npm) in the repo |
 | TypeScript types are generated from the backend OpenAPI (`openapi-typescript`), so the cross-language contract is type-checked | Front-end skills are needed on the team |
 
@@ -161,7 +162,8 @@ filetra/
 │  │  ├─ graph.py              # graph document model (pydantic) + validation
 │  │  ├─ executor.py           # topological run, per-node caching, cancellation, events
 │  │  ├─ provenance.py         # Assertion model, precedence/reconciliation
-│  │  └─ templates.py          # pattern-template engine: JSON load, regex compile, match, format (§5.3)
+│  │  └─ templates.py          # pattern-template engine: regex compile, match, format (§5.3)
+│  ├─ config.py               # strict YAML loading → pydantic models, schema export (§4.8)
 │  ├─ store/
 │  │  ├─ base.py               # repository interfaces (control store, dataset store)
 │  │  ├─ control_sqlite.py     # roots, projects, runs, graphs, cache index, scan checkpoints
@@ -181,8 +183,8 @@ filetra/
 │  │  ├─ aggregate/summary.py
 │  │  └─ sinks/{csv,jsonl,json,parquet,excel}.py
 │  ├─ conventions/             # NamingConvention modules (iso19650.py, …), revision schemes, code lists
-│  │                           #   later: data-driven conventions (JSON templates) as another implementation
-│  ├─ templates/               # example template files: projects.example.json
+│  │                           #   later: data-driven conventions (YAML templates) as another implementation
+│  ├─ templates/               # example config: projects.example.yaml, pipeline.example.yaml
 │  ├─ api/                     # FastAPI app: catalog, graphs, runs, results, events
 │  └─ cli.py                   # Typer: scan, run, nodes, serve, validate
 ├─ web/                        # TypeScript SPA (separate package.json, built to static files)
@@ -249,7 +251,7 @@ class NamingConventionParser:
 **Port types** are *named table schemas* (`FileObjects`, `ParsedFields`, `Documents`,
 `Revisions`, `Assertions`, …). Each one is a set of column names, dtypes and required flags. An
 edge is valid when the output schema satisfies the input schema (structural, so extra columns are
-allowed). Both the GUI (while drawing an edge) and the engine (`filetra validate graph.json`)
+allowed). Both the GUI (while drawing an edge) and the engine (`filetra validate pipeline.yaml`)
 check this.
 
 **Simple functions:** a `@transform` shorthand wraps a plain function
@@ -269,27 +271,39 @@ A firm-specific package (`filetra-acme`) adds nodes and conventions without fork
 
 ### 4.3 Graph document (the GUI ↔ engine contract)
 
-```json
-{
-  "format": "filetra.graph/1",
-  "name": "Riverside – disk register",
-  "nodes": [
-    {"id": "scan",  "type": "filetra.source.fs_scan@1",
-     "config": {"roots": ["\\\\fs01\\Projects\\P1234"], "exclude": ["**/~$*", "**/Thumbs.db"]}},
-    {"id": "name",  "type": "filetra.parse.naming_convention@1", "config": {"preset": "iso19650"}},
-    {"id": "group", "type": "filetra.transform.group_documents@1", "config": {"revision_scheme": "iso19650"}},
-    {"id": "xlsx",  "type": "filetra.sink.excel@1", "config": {"path": "out/register.xlsx"}}
-  ],
-  "edges": [
-    {"from": "scan.files",   "to": "name.files"},
-    {"from": "name.parsed",  "to": "group.parsed"},
-    {"from": "group.latest", "to": "xlsx.rows"}
-  ],
-  "ui": {"positions": {"scan": [0, 0], "name": [240, 0]}}
-}
+```yaml
+# yaml-language-server: $schema=../schemas/filetra.graph-1.json
+format: filetra.graph/1
+name: Riverside – disk register
+
+nodes:
+  - id: scan
+    type: filetra.source.fs_scan@1
+    config:
+      roots: ['\\fs01\Projects\P1234']
+      exclude: ['**/~$*', '**/Thumbs.db']
+  - id: name
+    type: filetra.parse.naming_convention@1
+    config: { convention: iso19650 }
+  - id: group
+    type: filetra.transform.group_documents@1
+    config: { revision_scheme: iso19650 }
+  - id: out
+    type: filetra.sink.csv@1
+    config: { path: out/register.csv }
+
+edges:
+  - { from: scan.files,   to: name.files }
+  - { from: name.parsed,  to: group.parsed }
+  - { from: group.latest, to: out.rows }
+
+ui:                       # GUI layout only, ignored by the engine
+  positions: { scan: [0, 0], name: [240, 0] }
 ```
 
-`ui` is opaque to the engine. Keeping layout separate from semantics keeps diffs clean.
+`ui` is opaque to the engine. Keeping layout separate from semantics keeps diffs clean. Over
+HTTP, the same document travels as JSON, because the API is not a configuration file. The engine
+reads and writes YAML only on disk.
 
 ### 4.4 Executor
 
@@ -391,6 +405,51 @@ Every export also writes a small `manifest.json` next to the data. It records th
 versions, the run id, the time, the row counts and the source projects, so any CSV can be traced
 back to how it was produced.
 
+### 4.8 Configuration loading (D8)
+
+YAML is easier to read and edit by hand than JSON. It allows comments, and single-quoted strings
+need no backslash escaping, which suits regexes and UNC paths. Its *implicit typing* is a known
+hazard, though, and it would hit this domain directly:
+
+| YAML 1.1 surprise | Example | Why it matters here |
+|---|---|---|
+| Leading zeros lost / octal | `project_id: 01234` → `668` or `1234` | Project and document numbers often have leading zeros |
+| "Norway problem" | `country: NO` → `false`; `on`/`off`/`yes` → booleans | Code-list values like `NO`, `ON` and `Y` occur in AEC codes |
+| Numbers vs strings | `revision: 1.10` → `1.1` | Revision and version codes |
+| Dates | `2024-03-01` → `date` object | Folder names and codes that look like dates |
+
+**Approach:**
+- **Use `ruamel.yaml` with the `base` loader**, which returns *every scalar as a string*. Types
+  then come only from the **pydantic models**, so nothing is guessed. This is the StrictYAML idea
+  without the extra dependency. PyYAML is rejected because it implements YAML 1.1, which has all of
+  the surprises above.
+- **No `null`:** with strings-only loading, `null` and `~` arrive as the strings `"null"` and `"~"`.
+  Schemas therefore never rely on null. An absent value is an omitted key, and "must not match"
+  is an explicit field such as `match: false`. Booleans are still fine, because pydantic converts
+  `"true"`/`"false"` only where the model declares a `bool`.
+- **Reject duplicate keys, anchors/aliases and custom tags.** They are rarely needed in
+  configuration and they make files harder to review. Only safe loading is used; no Python object
+  construction.
+- **Every config file starts with `format: filetra.<kind>/<version>`.** This routes the file to the
+  right model and the right migrations.
+- **Schemas for editors:** `filetra schema export` writes JSON Schemas generated from the pydantic
+  models. A `# yaml-language-server: $schema=…` first line then gives autocomplete and validation
+  in VS Code's YAML extension and other editors.
+- **Errors point to the file:** validation errors report the file, line, column and field path,
+  e.g. `templates.yaml:14:9 templates[0].levels[1].pattern: invalid regex: …`.
+- **Writing from the GUI later:** when the GUI saves a file, it uses `ruamel.yaml` round-trip mode
+  so that hand-written **comments and ordering are preserved**. A GUI that silently strips comments
+  from someone's carefully annotated templates would destroy trust quickly.
+
+**Critique:**
+- *YAML is a large, subtle spec.* Restricting the loader (strings only, no anchors or tags)
+  turns it into "indented key–value text with comments", which is all that's needed.
+- *Indentation errors* are the most common hand-editing mistake. The schema-aware editor and the
+  line/column errors mitigate it.
+- *Two formats in the system* (YAML on disk, JSON over HTTP and in exports) is acceptable. Both
+  map to the same pydantic models, and the boundary is clear: **configuration is YAML; data and
+  wire formats are JSON**.
+
 ---
 
 ## 5. First source: file-system scan (specifics)
@@ -461,7 +520,7 @@ The meaning comes from three places, and each one gets a dedicated node:
    vs contractual) belong to the scheme.
 
 The longer-term goal (after D2's fixed modules) is to ship conventions as **data**, using the same
-JSON pattern-template engine as project folders (§5.3). A firm can
+YAML pattern-template engine as project folders (§5.3). A firm can
 then encode its own standard without writing Python, and the GUI can edit it.
 
 *Critique:* naming conventions are applied inconsistently in practice. Regex-per-field is
@@ -475,7 +534,7 @@ node that emits low-confidence assertions.
 Thousands of projects live as folders on **one or two shares**. The *list of projects* is data
 in its own right, and it is **discovered from the folder structure**, not maintained by hand:
 
-- **Roots and templates (D7):** a JSON file lists the UNC roots, e.g. `\\fs01\Projects`, and the
+- **Roots and templates (D7, D8):** a YAML file lists the UNC roots, e.g. `\\fs01\Projects`, and the
   **project templates** that apply to each root. A template says at which depth project folders
   sit and extracts key data from their names with regex named groups (§5.3). Folders that match
   no template are reported as *unclassified* rather than silently skipped.
@@ -483,7 +542,7 @@ in its own right, and it is **discovered from the folder structure**, not mainta
   applies the templates. It creates or updates **Projects** in the control store with id, the
   extracted fields (number, name, client, …), folder(s), the id of the template that matched,
   first seen and last seen. Projects that disappear are marked *missing*, never deleted. An
-  **optional override** section in the same JSON (keyed by project id: `convention`, `enabled`,
+  **optional override** section in the same YAML (keyed by project id: `convention`, `enabled`,
   `tags`, `extra_folders`) handles exceptions, such as a project split across two roots,
   disabling an archive, or assigning a client's naming convention (D2).
 - **Scheduling:** the scan unit is **one project**. Everything sits on one or two file servers,
@@ -516,53 +575,45 @@ One small engine, `core/templates.py`, turns *names* into *fields* using user-ed
 templates. Phase 0 uses it for project folders. The same engine is designed to back
 `path_segments` and, later, data-driven naming conventions, so users learn one mechanism.
 
-**File format** (`filetra.templates/1`, JSON):
+**File format** (`filetra.templates/1`, YAML):
 
-```json
-{
-  "format": "filetra.templates/1",
-  "roots": [
-    {
-      "id": "fs01-projects",
-      "path": "\\\\fs01\\Projects",
-      "templates": ["numbered", "client-numbered"],
-      "exclude": ["^_", "^~", "^(Archive|Templates|Admin)$"]
-    }
-  ],
-  "templates": [
-    {
-      "id": "numbered",
-      "description": "12345 Project Name",
-      "levels": [
-        { "pattern": "(?P<project_number>\\d{4,6})[ _-]+(?P<project_name>.+)" }
-      ],
-      "fields": {
-        "project_id": "{project_number}",
-        "project_name": "{project_name|strip}"
-      },
-      "examples": [
-        { "path": "12345 Riverside Tower",
-          "expect": { "project_id": "12345", "project_name": "Riverside Tower" } },
-        { "path": "Admin", "expect": null }
-      ]
-    },
-    {
-      "id": "client-numbered",
-      "description": "Client\\12345 - Project Name",
-      "levels": [
-        { "pattern": "(?P<client>[A-Za-z][\\w &.-]*)" },
-        { "pattern": "(?P<project_number>\\d{4,6})\\s*-\\s*(?P<project_name>.+)" }
-      ],
-      "fields": {
-        "project_id": "{client|upper}-{project_number}",
-        "client": "{client|strip}"
-      }
-    }
-  ],
-  "overrides": {
-    "12345": { "convention": "iso19650", "tags": ["live"] }
-  }
-}
+```yaml
+# yaml-language-server: $schema=schemas/filetra.templates-1.json
+format: filetra.templates/1
+
+roots:
+  - id: fs01-projects
+    path: '\\fs01\Projects'            # single quotes: no escaping needed
+    templates: [numbered, client-numbered]
+    exclude: ['^_', '^~', '^(Archive|Templates|Admin)$']
+
+templates:
+  - id: numbered
+    description: 12345 Project Name
+    levels:
+      - pattern: '(?P<project_number>\d{4,6})[ _-]+(?P<project_name>.+)'
+    fields:
+      project_id: '{project_number}'
+      project_name: '{project_name|strip}'
+    examples:
+      - path: 12345 Riverside Tower
+        expect: { project_id: '12345', project_name: Riverside Tower }
+      - path: 01234 Old Mill             # leading zero kept: everything loads as a string
+        expect: { project_id: '01234', project_name: Old Mill }
+      - path: Admin
+        match: false                     # must not match (see §4.8: no nulls)
+
+  - id: client-numbered
+    description: 'Client\12345 - Project Name'
+    levels:
+      - pattern: '(?P<client>[A-Za-z][\w &.-]*)'
+      - pattern: '(?P<project_number>\d{4,6})\s*-\s*(?P<project_name>.+)'
+    fields:
+      project_id: '{client|upper}-{project_number}'
+      client: '{client|strip}'
+
+overrides:
+  '12345': { convention: iso19650, tags: [live] }
 ```
 
 **Semantics:**
@@ -583,23 +634,24 @@ templates. Phase 0 uses it for project folders. The same engine is designed to b
   and confidence 1.0, consistent with §4.5.
 
 **Validation and testing:**
-- A JSON Schema for the file is generated from the pydantic models. Editors such as VS Code then
-  give autocomplete and validation while the file is edited by hand, and the future GUI gets its
+- A JSON Schema for the file is generated from the pydantic models (§4.8). Editors such as VS Code
+  with the YAML extension then give autocomplete and validation while the file is edited by hand, and the future GUI gets its
   form from the same schema.
 - At load time every regex is compiled, and each `{placeholder}` must refer to a named group that
   exists. Errors name the template id and the offending pattern.
-- **`examples` are executable tests.** `filetra templates test templates.json` runs them, and
-  `filetra templates try templates.json "\\fs01\Projects\12345 Riverside"` shows which template
+- **`examples` are executable tests.** `filetra templates test templates.yaml` runs them, and
+  `filetra templates try templates.yaml "\\fs01\Projects\12345 Riverside"` shows which template
   matched, the extracted fields and why other templates didn't match. `filetra templates report`
   runs the templates against a live root (top levels only) and lists the match count per
   template and every unclassified folder. This loop is how users tune the templates.
 
 **Critique:**
-- *Regex in JSON is unpleasant:* every backslash must be doubled (`\\d`). The mitigations are the
-  `try`/`test` commands, which surface mistakes immediately, and the later GUI editor, which hides
-  the escaping. If hand-editing stays common, a later option is a simpler placeholder syntax that
-  compiles to regex, such as `"{project_number:\\d{5}} {project_name}"`. JSON5 or YAML could also
-  be accepted as alternative file formats with no change to the engine.
+- *Regex in config files:* YAML single-quoted strings need no backslash escaping (`'\d{4,6}'`).
+  The one escape is that a literal `'` is written `''`, so regexes stay readable. The
+  `try`/`test` commands surface mistakes immediately, and a later GUI editor can add live
+  highlighting. If users find raw regex too hard, a simpler placeholder syntax that compiles to
+  regex, such as `'{project_number:\d{5}} {project_name}'`, can be added later without changing
+  the engine.
 - *Templates can grow into a programming language:* the filter set is deliberately small and
   closed. Anything more complex belongs in a Python plugin node, not in the template.
 - *Regex performance* doesn't matter here. Thousands of project folders is trivial, and even
@@ -654,7 +706,7 @@ GET  /api/entities/{id}/provenance  assertions behind each value
 
 | Phase | Deliverable | Why this order |
 |---|---|---|
-| **0. Core + CLI** | model, protocols, registry, graph and partitioned executor, SQLite control store plus Parquet datasets; pattern-template engine + `filetra templates test/try/report`; nodes `project_discovery` (JSON templates), `fs_scan` (read-only, resumable, concurrency-limited), `listing_file`, `path_segments`, `naming_convention` with a **fixed module** (ISO 19650; more modules later), `revision`, `group_documents`; **CSV / JSONL / JSON** sinks with manifest; `filetra run graph.json`; a synthetic generator that builds 10⁶–10⁸-row listings for load tests | Tests the hardest assumption, *can we infer reliable metadata from real paths?*, with real data before any GUI investment. It also proves the D3 scale path early. |
+| **0. Core + CLI** | model, protocols, registry, graph and partitioned executor, SQLite control store plus Parquet datasets; pattern-template engine + `filetra templates test/try/report`; nodes `project_discovery` (JSON templates), `fs_scan` (read-only, resumable, concurrency-limited), `listing_file`, `path_segments`, `naming_convention` with a **fixed module** (ISO 19650; more modules later), `revision`, `group_documents`; **CSV / JSONL / JSON** sinks with manifest; `filetra run pipeline.yaml`; a synthetic generator that builds 10⁶–10⁸-row listings for load tests | Tests the hardest assumption, *can we infer reliable metadata from real paths?*, with real data before any GUI investment. It also proves the D3 scale path early. |
 | **1. API** | FastAPI over the engine: catalog, runs, results, convention tester, events | Makes the contract concrete. OpenAPI then generates the TS types. |
 | **2. Web UI: results first** | results grid with filters, a provenance drawer, a rejects review, a naming-convention builder and tester | Highest user value, and needs no graph editor |
 | **3. Web UI: graph editor** | React Flow canvas driven by `/catalog`, schema-generated config forms, per-node preview | Built once nodes and contracts have stabilised |
