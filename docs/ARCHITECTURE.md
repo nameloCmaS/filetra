@@ -134,11 +134,56 @@ None of that needs a custom canvas, which was the main reason for a TypeScript f
 
 | Option | Verdict | Reasoning |
 |---|---|---|
-| **NiceGUI** | ✓ **Recommended** | *Python only*, so there's one language and one toolchain. It is built on FastAPI with Vue/Quasar components. It includes AG Grid, server-paged tables, forms, a code editor and live-updating elements. `native=True` runs it in a pywebview window, which gives the desktop app (§6, mode B) almost for free, and the same app also runs in a browser. |
+| **NiceGUI** | ✓ **Recommended, with the state mitigations below** | *Python only*, so there's one language and one toolchain. It is built on FastAPI with Vue/Quasar components. It includes AG Grid, server-paged tables, forms, a code editor and live-updating elements. `native=True` runs it in a pywebview window, which gives the desktop app (§6, mode B) almost for free, and the same app also runs in a browser. |
 | TypeScript + React SPA | ~ Upgrade path | It offers the most control and the largest ecosystem, but adds a second language, npm and front-end skills. Only worth it if NiceGUI's limits are hit. Because the GUI talks only to the HTTP API, it can be swapped later without touching the engine. |
-| Qt (PySide6) | ~ Viable | A real desktop app, and its model/view tables handle millions of rows very well. On the other hand, development is slower, it can't be used from a browser, PyInstaller bundles are large, and it is harder to restyle. |
+| Qt (PySide6) | ~ **Python-only fallback** | A real desktop app, so window state is never lost and nothing reconnects, and its model/view tables handle millions of rows very well. On the other hand, development is slower, it can't be used from a browser, PyInstaller bundles are large, and it is harder to restyle. |
 | Streamlit | ✗ | Its "re-run the whole script on every interaction" model fights a stateful app with long-running scans and server-side paging. |
-| Dash / Panel | ✗ | They are oriented to dashboards and charts. They could do the job but are no better than NiceGUI for it. |
+| Dash | ~ Python alternative | The front end is a client-side React app and callbacks are plain HTTP requests. A backgrounded tab keeps its DOM, scroll and state (`persistence=True`), and `dash-ag-grid` supports server-side row models. On the other hand, larger apps tangle into callback chains, and live progress needs polling. |
+| Panel | ✗ | Server-side state over a WebSocket, so it has the same reconnect problem as NiceGUI without its advantages. |
+
+#### NiceGUI state retention (known weakness, mitigated)
+
+**The problem.** NiceGUI keeps the UI tree and its state *on the server*, tied to a WebSocket. When
+a window is put aside, browsers throttle background tabs and the socket drops. If it doesn't
+reconnect within `reconnect_timeout` (**default 3 s**), the server deletes that client. On
+reconnect the page is then rebuilt from scratch: in-memory state is gone, everything redraws, and
+there's a visible delay.
+
+**Tested** (NiceGUI 4.0, Chromium, 12 s simulated disconnect, a page with a server-side counter
+and a JS marker):
+
+| Setting | After reconnect |
+|---|---|
+| default `reconnect_timeout=3` | **page reloaded**: JS marker gone, server state reset (`count 2` → `count 0`) |
+| `reconnect_timeout=3600` | **no reload**: marker, server state (`count 2`) and scroll position all intact |
+
+**Mitigations, in order of effect:**
+1. **Set a long `reconnect_timeout`** (hours) in `ui.run(...)`. The server keeps the client
+   alive, and the browser reattaches silently with no redraw, keeping its scroll position. For a
+   single-user app the memory cost of keeping a client alive is negligible. This removes the
+   common case entirely.
+2. **Persist view state explicitly for the cases (1) can't cover.** Those are a browser
+   discarding a background tab (Chrome Memory Saver), the app restarting, or the user pressing F5.
+   - Keep the selected project, filters, sort, page and grid column state in `app.storage.tab`
+     (per tab) or `app.storage.user` (persisted across restarts).
+   - Record the grid position with AG Grid's state API and a debounced scroll handler, and
+     restore it on build with `initialState` and `ensureIndexVisible`.
+   - This restores *where you were*, but a redraw and a short delay remain in these cases.
+3. **Make rebuilds cheap.** Pages build their skeleton immediately and fetch data asynchronously.
+   The results grid uses server-side paging, so a rebuild fetches about 100 rows, not 10⁶. Page
+   rebuild never re-queries or re-runs anything expensive.
+4. **Desktop mode (§6 B):** the pywebview window isn't subject to Chrome's tab discarding. With
+   (1) in place, minimising the window and coming back is seamless. Server restarts are covered
+   by (2).
+
+**When to abandon NiceGUI instead:** if, after (1)–(3), the remaining reloads are still
+unacceptable, the root cause is architectural (view state lives on the server), and it can only be
+removed by a GUI whose view state lives *in the client*:
+- **Qt (PySide6):** stays Python-only and suits desktop-first single-user use (D1).
+- **A TypeScript SPA:** the most robust option, and it also works in a browser, but adds a second
+  language.
+
+Either one replaces only `filetra.gui`. The engine, API and client are unaffected.
 
 **Keeping GUI and engine separate in an all-Python stack.** Using one language makes it tempting
 for the GUI to import the engine directly. Prevent that:
@@ -149,7 +194,7 @@ for the GUI to import the engine directly. Prevent that:
   it uses normal HTTP. The GUI code is the same in both cases.
 
 **Critique:**
-- *NiceGUI is a smaller project than React.* The UI is server-driven: each interaction is a
+- *NiceGUI is a smaller project than React.* The UI is server-driven (see state retention above): each interaction is a
   WebSocket round-trip to Python. That's ideal for a local single-user app and fine on a LAN, but
   highly custom widgets are harder to build. The API boundary is the hedge, because the GUI can be
   replaced without touching the engine.
